@@ -72,6 +72,11 @@ impl ProgressReporter {
         self.processed_files = self.processed_files.saturating_add(1);
         self.emit(current_file);
     }
+
+    fn finish(&mut self) {
+        self.processed_files = self.total_files;
+        self.emit(None);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +176,8 @@ fn perform_sync(
         &mut progress,
         dry_run,
     )?;
+
+    progress.finish();
 
     Ok(SyncSummary {
         device: device_info.into(),
