@@ -36,6 +36,7 @@ type SyncProgressState = {
 };
 
 const LOCAL_PATH_STORAGE_KEY = "android-sync:lastLocalPath";
+const DEVICE_PATH_STORAGE_KEY = "android-sync:lastDevicePath";
 const PROGRESS_EVENT = "sync-progress";
 
 const formatBytes = (bytes: number) => {
@@ -61,6 +62,8 @@ function App() {
   const [error, setError] = useState("");
   const [summary, setSummary] = useState<SyncSummary | null>(null);
   const [progress, setProgress] = useState<SyncProgressState | null>(null);
+  const [localPathHydrated, setLocalPathHydrated] = useState(false);
+  const [devicePathHydrated, setDevicePathHydrated] = useState(false);
 
   const canSync = useMemo(() => {
     return (
@@ -89,11 +92,13 @@ function App() {
       }
     } catch (storageError) {
       console.warn("Failed to restore last local path:", storageError);
+    } finally {
+      setLocalPathHydrated(true);
     }
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (typeof window === "undefined" || !localPathHydrated) return;
     try {
       if (localPath) {
         window.localStorage.setItem(LOCAL_PATH_STORAGE_KEY, localPath);
@@ -103,7 +108,34 @@ function App() {
     } catch (storageError) {
       console.warn("Failed to persist local path:", storageError);
     }
-  }, [localPath]);
+  }, [localPath, localPathHydrated]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const stored = window.localStorage.getItem(DEVICE_PATH_STORAGE_KEY);
+      if (stored) {
+        setDevicePath(stored);
+      }
+    } catch (storageError) {
+      console.warn("Failed to restore last device path:", storageError);
+    } finally {
+      setDevicePathHydrated(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !devicePathHydrated) return;
+    try {
+      if (devicePath) {
+        window.localStorage.setItem(DEVICE_PATH_STORAGE_KEY, devicePath);
+      } else {
+        window.localStorage.removeItem(DEVICE_PATH_STORAGE_KEY);
+      }
+    } catch (storageError) {
+      console.warn("Failed to persist device path:", storageError);
+    }
+  }, [devicePath, devicePathHydrated]);
 
   useEffect(() => {
     let cancelled = false;
