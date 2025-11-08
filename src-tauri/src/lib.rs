@@ -51,8 +51,11 @@ impl ProgressReporter {
     }
 
     fn file_processed(&mut self, current_file: Option<&str>) {
-        self.processed_files = self.processed_files.saturating_add(1);
-        self.emit(current_file);
+        self.advance(current_file);
+    }
+
+    fn directory_prepared(&mut self, directory: &str) {
+        self.advance(Some(directory));
     }
 
     fn emit(&self, current_file: Option<&str>) {
@@ -63,6 +66,11 @@ impl ProgressReporter {
             dry_run: self.dry_run,
         };
         let _ = self.window.emit(PROGRESS_EVENT, payload);
+    }
+
+    fn advance(&mut self, current_file: Option<&str>) {
+        self.processed_files = self.processed_files.saturating_add(1);
+        self.emit(current_file);
     }
 }
 
@@ -119,13 +127,32 @@ fn perform_sync(
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
     let total_files = count_local_files(&local_root)?;
+    let remote_directories = collect_remote_directories(&local_root, &remote_root)?;
+    let directories_to_create = remote_directories
+        .iter()
+        .filter(|dir| normalize_remote_dir_path(dir.as_str()) != "/")
+        .count();
 
     let device_info = detect_android_device()?;
-    let mut adb_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
 
     let mut created_dirs = HashSet::new();
     let mut stats = SyncStats::default();
-    let mut progress = ProgressReporter::new(window, total_files, dry_run);
+    let mut progress = ProgressReporter::new(
+        window,
+        total_files.saturating_add(directories_to_create),
+        dry_run,
+    );
+
+    create_remote_directories(
+        &device_info,
+        &remote_directories,
+        dry_run,
+        &mut created_dirs,
+        &mut stats,
+        &mut progress,
+    )?;
+
+    let mut adb_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
 
     ensure_remote_dir(
         &mut adb_device,
@@ -292,11 +319,7 @@ fn ensure_remote_dir(
     stats: &mut SyncStats,
     dry_run: bool,
 ) -> Result<(), SyncError> {
-    let normalized = if remote_dir == "/" {
-        "/".to_string()
-    } else {
-        remote_dir.trim_end_matches('/').to_string()
-    };
+    let normalized = normalize_remote_dir_path(remote_dir);
 
     if !created_dirs.insert(normalized.clone()) {
         return Ok(());
@@ -308,6 +331,108 @@ fn ensure_remote_dir(
             device.shell_command(&["mkdir", "-p", normalized.as_str()], &mut sink)?;
         }
         stats.directories_created += 1;
+    }
+
+    Ok(())
+}
+
+fn normalize_remote_dir_path(path: &str) -> String {
+    if path == "/" {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
+}
+
+fn collect_remote_directories(local_root: &Path, remote_root: &str) -> Result<Vec<String>, SyncError> {
+    let mut directories = HashSet::new();
+    directories.insert(normalize_remote_dir_path(remote_root));
+    collect_remote_directories_recursive(local_root, local_root, remote_root, &mut directories)?;
+
+    let mut list: Vec<_> = directories.into_iter().collect();
+    list.sort_by(|a, b| {
+        directory_depth(a.as_str())
+            .cmp(&directory_depth(b.as_str()))
+            .then_with(|| a.cmp(b))
+    });
+    Ok(list)
+}
+
+fn collect_remote_directories_recursive(
+    root: &Path,
+    current: &Path,
+    remote_root: &str,
+    directories: &mut HashSet<String>,
+) -> Result<(), SyncError> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if should_skip_entry(&path) {
+            continue;
+        }
+
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or_else(|_| Path::new(""));
+            let remote_dir = build_remote_path(remote_root, relative);
+            directories.insert(normalize_remote_dir_path(remote_dir.as_str()));
+            collect_remote_directories_recursive(root, &path, remote_root, directories)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn directory_depth(path: &str) -> usize {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+}
+
+fn create_remote_directories(
+    device_info: &AndroidDeviceInfo,
+    directories: &[String],
+    dry_run: bool,
+    created_dirs: &mut HashSet<String>,
+    stats: &mut SyncStats,
+    progress: &mut ProgressReporter,
+) -> Result<(), SyncError> {
+    let needs_device = !dry_run
+        && directories
+            .iter()
+            .any(|dir| normalize_remote_dir_path(dir.as_str()) != "/");
+
+    let mut shell_device = if needs_device {
+        Some(ADBUSBDevice::new(
+            device_info.vendor_id,
+            device_info.product_id,
+        )?)
+    } else {
+        None
+    };
+
+    for dir in directories {
+        let normalized = normalize_remote_dir_path(dir.as_str());
+        if !created_dirs.insert(normalized.clone()) {
+            continue;
+        }
+
+        if normalized == "/" {
+            continue;
+        }
+
+        if let Some(device) = shell_device.as_mut() {
+            if !dry_run {
+                let mut sink = io::sink();
+                device.shell_command(&["mkdir", "-p", normalized.as_str()], &mut sink)?;
+            }
+        }
+
+        stats.directories_created += 1;
+        progress.directory_prepared(normalized.as_str());
     }
 
     Ok(())

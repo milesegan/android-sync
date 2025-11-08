@@ -54,70 +54,85 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         message: ADBTransportMessage,
         private_key: &ADBRsaKey,
     ) -> Result<()> {
-        match message.header().command() {
-            MessageCommand::Auth => {
-                log::debug!("Authentication required");
+        let mut next_message = Some(message);
+
+        loop {
+            let current_message = match next_message.take() {
+                Some(message) => message,
+                None => self
+                    .get_transport_mut()
+                    .read_message_with_timeout(Duration::from_secs(10))?,
+            };
+
+            match current_message.header().command() {
+                MessageCommand::Cnxn => {
+                    log::info!(
+                        "Authentication OK, device info {}",
+                        String::from_utf8(current_message.into_payload())?
+                    );
+                    return Ok(());
+                }
+                MessageCommand::Auth => match current_message.header().arg0() {
+                    AUTH_TOKEN => {
+                        log::debug!("Authentication challenge received (token)");
+                        let sign = private_key.sign(current_message.into_payload())?;
+                        let reply =
+                            ADBTransportMessage::new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign);
+                        self.get_transport_mut().write_message(reply)?;
+                    }
+                    AUTH_RSAPUBLICKEY => {
+                        log::debug!("Device requested RSA public key, sending it");
+                        let mut pubkey = private_key.android_pubkey_encode()?.into_bytes();
+                        pubkey.push(b'\0');
+                        let reply = ADBTransportMessage::new(
+                            MessageCommand::Auth,
+                            AUTH_RSAPUBLICKEY,
+                            0,
+                            &pubkey,
+                        );
+                        self.get_transport_mut().write_message(reply)?;
+                    }
+                    other => {
+                        return Err(RustADBError::ADBRequestFailed(format!(
+                            "Received AUTH message with unsupported type ({other})"
+                        )));
+                    }
+                },
+                MessageCommand::Clse => {
+                    log::debug!("Ignoring stray CLSE during auth handshake");
+                }
+                MessageCommand::Okay => {
+                    log::debug!("Ignoring stray OKAY during auth handshake");
+                }
+                MessageCommand::Write => {
+                    log::debug!("Ignoring stray WRTE during auth handshake");
+                }
+                other => {
+                    return Err(RustADBError::WrongResponseReceived(
+                        other.to_string(),
+                        MessageCommand::Cnxn.to_string(),
+                    ));
+                }
             }
-            _ => return Ok(()),
+
+            next_message = None;
         }
-
-        // At this point, we should have received an AUTH message with arg0 == 1
-        let auth_message = match message.header().arg0() {
-            AUTH_TOKEN => message,
-            v => {
-                return Err(RustADBError::ADBRequestFailed(format!(
-                    "Received AUTH message with type != 1 ({v})"
-                )));
-            }
-        };
-
-        let sign = private_key.sign(auth_message.into_payload())?;
-
-        let message = ADBTransportMessage::new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign);
-
-        self.get_transport_mut().write_message(message)?;
-
-        let received_response = self.get_transport_mut().read_message()?;
-
-        if received_response.header().command() == MessageCommand::Cnxn {
-            log::info!(
-                "Authentication OK, device info {}",
-                String::from_utf8(received_response.into_payload())?
-            );
-            return Ok(());
-        }
-
-        let mut pubkey = private_key.android_pubkey_encode()?.into_bytes();
-        pubkey.push(b'\0');
-
-        let message = ADBTransportMessage::new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey);
-
-        self.get_transport_mut().write_message(message)?;
-
-        let response = self
-            .get_transport_mut()
-            .read_message_with_timeout(Duration::from_secs(10))
-            .and_then(|message| {
-                message.assert_command(MessageCommand::Cnxn)?;
-                Ok(message)
-            })?;
-
-        log::info!(
-            "Authentication OK, device info {}",
-            String::from_utf8(response.into_payload())?
-        );
-        Ok(())
     }
 
     /// Receive a message and acknowledge it by replying with an `OKAY` command
     pub(crate) fn recv_and_reply_okay(&mut self) -> Result<ADBTransportMessage> {
         let message = self.transport.read_message()?;
-        self.transport.write_message(ADBTransportMessage::new(
-            MessageCommand::Okay,
-            self.get_local_id()?,
-            self.get_remote_id()?,
-            &[],
-        ))?;
+        match message.header().command() {
+            MessageCommand::Write | MessageCommand::Clse => {
+                self.transport.write_message(ADBTransportMessage::new(
+                    MessageCommand::Okay,
+                    self.get_local_id()?,
+                    self.get_remote_id()?,
+                    &[],
+                ))?;
+            }
+            _ => {}
+        }
         Ok(message)
     }
 
@@ -128,10 +143,34 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     ) -> Result<ADBTransportMessage> {
         self.transport.write_message(message)?;
 
-        self.transport.read_message().and_then(|message| {
-            message.assert_command(MessageCommand::Okay)?;
-            Ok(message)
-        })
+        loop {
+            let response = self.transport.read_message()?;
+            match response.header().command() {
+                MessageCommand::Okay => {
+                    return Ok(response);
+                }
+                MessageCommand::Write => {
+                    log::debug!(
+                        "ignoring unexpected WRTE while waiting for OKAY; acknowledging"
+                    );
+                    self.transport.write_message(ADBTransportMessage::new(
+                        MessageCommand::Okay,
+                        self.get_local_id()?,
+                        self.get_remote_id()?,
+                        &[],
+                    ))?;
+                }
+                MessageCommand::Clse => {
+                    log::debug!("ignoring unexpected CLSE while waiting for OKAY");
+                }
+                other => {
+                    return Err(RustADBError::WrongResponseReceived(
+                        other.to_string(),
+                        MessageCommand::Okay.to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     pub(crate) fn recv_file<W: std::io::Write>(
@@ -211,10 +250,12 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
                     self.send_and_expect_okay(message)?;
 
-                    // Command should end with a Write => Okay
-                    let received = self.transport.read_message()?;
+                    // Command should end with a Write => Okay, but some devices shortcut by closing.
+                    let received = self.recv_and_reply_okay()?;
                     match received.header().command() {
                         MessageCommand::Write => return Ok(()),
+                        MessageCommand::Clse => return Ok(()),
+                        MessageCommand::Okay => continue,
                         c => {
                             return Err(RustADBError::ADBRequestFailed(format!(
                                 "Wrong command received {c}"
@@ -264,7 +305,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             self.get_remote_id()?,
             remote_path.as_bytes(),
         ))?;
-        let response = self.transport.read_message()?;
+        let response = self.recv_and_reply_okay()?;
         // Skip first 4 bytes as this is the literal "STAT".
         // Interesting part starts right after
 

@@ -201,6 +201,16 @@ impl ADBUSBDevice {
                         "ignoring stray CLSE while waiting for AUTH/CNXN handshake message"
                     );
                 }
+                MessageCommand::Okay => {
+                    log::debug!(
+                        "ignoring stray OKAY while waiting for AUTH/CNXN handshake message"
+                    );
+                }
+                MessageCommand::Write => {
+                    log::debug!(
+                        "ignoring stray WRTE while waiting for AUTH/CNXN handshake message"
+                    );
+                }
                 other => {
                     return Err(RustADBError::WrongResponseReceived(
                         other.to_string(),
