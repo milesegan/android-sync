@@ -29,8 +29,8 @@ type SyncProgressEvent = {
 };
 
 type SyncProgressState = {
-  processed: number;
-  total: number;
+  processedFiles: number;
+  totalFiles: number;
   currentFile: string | null;
   dryRun: boolean;
 };
@@ -74,11 +74,11 @@ function App() {
   }, [devicePath, localPath, syncing]);
 
   const progressPercent = useMemo(() => {
-    if (!progress || progress.total === 0) {
+    if (!progress || progress.totalFiles === 0) {
       return null;
     }
-    const ratio = progress.total
-      ? Math.min(progress.processed / progress.total, 1)
+    const ratio = progress.totalFiles
+      ? Math.min(progress.processedFiles / progress.totalFiles, 1)
       : 0;
     return Math.round(ratio * 100);
   }, [progress]);
@@ -144,8 +144,8 @@ function App() {
     listen<SyncProgressEvent>(PROGRESS_EVENT, (event) => {
       const payload = event.payload;
       setProgress({
-        processed: payload.processed_files,
-        total: payload.total_files,
+        processedFiles: payload.processed_files,
+        totalFiles: payload.total_files,
         currentFile: payload.current_file ?? null,
         dryRun: payload.dry_run,
       });
@@ -196,8 +196,8 @@ function App() {
     setSyncing(true);
     setError("");
     setProgress({
-      processed: 0,
-      total: 0,
+      processedFiles: 0,
+      totalFiles: 0,
       currentFile: null,
       dryRun,
     });
@@ -314,8 +314,8 @@ function App() {
               />
             </div>
             <p className="sync-progress__details">
-              {progress && progress.total > 0
-                ? `Processed ${progress.processed} of ${progress.total} files`
+              {progress && progress.totalFiles > 0
+                ? `Processed ${progress.processedFiles} of ${progress.totalFiles} files`
                 : "Preparing file list…"}
             </p>
             {progress?.currentFile && (

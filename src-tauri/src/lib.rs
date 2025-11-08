@@ -50,14 +50,6 @@ impl ProgressReporter {
         reporter
     }
 
-    fn file_processed(&mut self, current_file: Option<&str>) {
-        self.advance(current_file);
-    }
-
-    fn directory_prepared(&mut self, directory: &str) {
-        self.advance(Some(directory));
-    }
-
     fn emit(&self, current_file: Option<&str>) {
         let payload = SyncProgressPayload {
             processed_files: self.processed_files,
@@ -68,13 +60,20 @@ impl ProgressReporter {
         let _ = self.window.emit(PROGRESS_EVENT, payload);
     }
 
-    fn advance(&mut self, current_file: Option<&str>) {
+    fn file_processed(&mut self, current_file: Option<&str>) {
+        if self.processed_files >= self.total_files {
+            self.total_files = self.total_files.saturating_add(1);
+        }
         self.processed_files = self.processed_files.saturating_add(1);
         self.emit(current_file);
     }
 
+    fn directory_prepared(&mut self, directory: &str) {
+        self.emit(Some(directory));
+    }
+
     fn finish(&mut self) {
-        self.processed_files = self.total_files;
+        self.total_files = self.processed_files;
         self.emit(None);
     }
 }
@@ -133,20 +132,11 @@ fn perform_sync(
     let remote_root = normalize_remote_path(&device_path)?;
     let total_files = count_local_files(&local_root)?;
     let remote_directories = collect_remote_directories(&local_root, &remote_root)?;
-    let directories_to_create = remote_directories
-        .iter()
-        .filter(|dir| normalize_remote_dir_path(dir.as_str()) != "/")
-        .count();
-
     let device_info = detect_android_device()?;
 
     let mut created_dirs = HashSet::new();
     let mut stats = SyncStats::default();
-    let mut progress = ProgressReporter::new(
-        window,
-        total_files.saturating_add(directories_to_create),
-        dry_run,
-    );
+    let mut progress = ProgressReporter::new(window, total_files, dry_run);
 
     create_remote_directories(
         &device_info,
@@ -257,13 +247,13 @@ fn sync_directory(
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let entry_path = entry.path();
-        let metadata = entry.metadata()?;
 
         if should_skip_entry(&entry_path) {
             stats.skipped_entries += 1;
             continue;
         }
 
+        let metadata = entry.metadata()?;
         let relative_path = entry_path
             .strip_prefix(root)
             .unwrap_or_else(|_| Path::new(""));
@@ -288,7 +278,14 @@ fn sync_directory(
                 .map(|p| build_remote_path(remote_root, p))
                 .unwrap_or_else(|| remote_root.to_string());
             ensure_remote_dir(device, &parent, created_dirs, stats, dry_run)?;
-            push_file(device, &entry_path, &remote_file, &metadata, stats, dry_run)?;
+            push_file(
+                device,
+                &entry_path,
+                remote_file.as_str(),
+                &metadata,
+                stats,
+                dry_run,
+            )?;
             progress.file_processed(Some(remote_file.as_str()));
         } else {
             stats.skipped_entries += 1;
@@ -351,7 +348,17 @@ fn normalize_remote_dir_path(path: &str) -> String {
     }
 }
 
-fn collect_remote_directories(local_root: &Path, remote_root: &str) -> Result<Vec<String>, SyncError> {
+fn directory_depth(path: &str) -> usize {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+}
+
+fn collect_remote_directories(
+    local_root: &Path,
+    remote_root: &str,
+) -> Result<Vec<String>, SyncError> {
     let mut directories = HashSet::new();
     directories.insert(normalize_remote_dir_path(remote_root));
     collect_remote_directories_recursive(local_root, local_root, remote_root, &mut directories)?;
@@ -380,9 +387,7 @@ fn collect_remote_directories_recursive(
 
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or_else(|_| Path::new(""));
+            let relative = path.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
             let remote_dir = build_remote_path(remote_root, relative);
             directories.insert(normalize_remote_dir_path(remote_dir.as_str()));
             collect_remote_directories_recursive(root, &path, remote_root, directories)?;
@@ -390,13 +395,6 @@ fn collect_remote_directories_recursive(
     }
 
     Ok(())
-}
-
-fn directory_depth(path: &str) -> usize {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
 }
 
 fn create_remote_directories(
