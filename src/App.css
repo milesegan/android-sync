@@ -55,6 +55,12 @@ label {
   color: #0f172a;
 }
 
+.form-hint {
+  margin: -0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #64748b;
+}
+
 input {
   border-radius: 10px;
   border: 1px solid #cbd5f5;
@@ -68,6 +74,83 @@ input:focus {
   outline: none;
   border-color: #2563eb;
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+.folder-picker {
+  border-radius: 10px;
+  border: 1px solid #cbd5f5;
+  padding: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  background-color: #f8fafc;
+}
+
+.folder-picker__button {
+  margin: 0;
+  padding: 0.65rem 1.2rem;
+  border-radius: 8px;
+  border: 1px solid #cbd5f5;
+  background: #e2e8f0;
+  color: #0f172a;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.folder-picker__button:hover {
+  background-color: #dbeafe;
+}
+
+.folder-picker__button:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+.folder-picker__path {
+  flex: 1;
+  font-size: 0.95rem;
+  color: #0f172a;
+  word-break: break-all;
+}
+
+.folder-picker__path--placeholder {
+  color: #94a3b8;
+}
+
+.dry-run-toggle {
+  margin-top: 0.25rem;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  border: 1px dashed #cbd5f5;
+  background: #f8fafc;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.dry-run-toggle p {
+  margin: 0;
+  color: #0f172a;
+}
+
+.dry-run-toggle__button {
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-radius: 999px;
+  border: 1px solid #cbd5f5;
+  background: #e2e8f0;
+  color: #0f172a;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.dry-run-toggle__button--active {
+  background: linear-gradient(135deg, #fbbf24, #f97316);
+  border-color: transparent;
+  color: #0f172a;
 }
 
 button {
@@ -86,6 +169,74 @@ button {
 button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.sync-progress {
+  margin-top: 0.5rem;
+  padding: 1rem 1.25rem;
+  border-radius: 12px;
+  border: 1px solid #cbd5f5;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.sync-progress__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.95rem;
+  color: #0f172a;
+}
+
+.sync-progress__bar {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+
+.sync-progress__bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  transition: width 0.2s ease;
+}
+
+.sync-progress__bar--indeterminate .sync-progress__bar-fill {
+  position: absolute;
+  width: 35%;
+  left: -35%;
+  animation: syncProgressIndeterminate 1.2s infinite;
+}
+
+.sync-progress__details {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #475569;
+}
+
+.sync-progress__path {
+  font-size: 0.75rem;
+  background: rgba(37, 99, 235, 0.08);
+  border-radius: 6px;
+  padding: 0.3rem 0.45rem;
+  color: #1e293b;
+  word-break: break-all;
+}
+
+@keyframes syncProgressIndeterminate {
+  0% {
+    left: -35%;
+  }
+  50% {
+    left: 50%;
+  }
+  100% {
+    left: 100%;
+  }
 }
 
 .status,
@@ -162,5 +313,61 @@ button:disabled {
 
   .subtitle {
     color: #94a3b8;
+  }
+
+  .folder-picker {
+    border-color: #475569;
+    background-color: #1e293b;
+  }
+
+  .folder-picker__button {
+    border-color: #475569;
+    background: #334155;
+    color: #e2e8f0;
+  }
+
+  .folder-picker__button:hover {
+    background: #475569;
+  }
+
+  .folder-picker__path {
+    color: #e2e8f0;
+  }
+
+  .dry-run-toggle {
+    border-color: #475569;
+    background: #1e293b;
+  }
+
+  .dry-run-toggle p {
+    color: #e2e8f0;
+  }
+
+  .dry-run-toggle__button {
+    border-color: #475569;
+    background: #334155;
+    color: #e2e8f0;
+  }
+
+  .sync-progress {
+    border-color: #334155;
+    background: #1e293b;
+  }
+
+  .sync-progress__header {
+    color: #e2e8f0;
+  }
+
+  .sync-progress__bar {
+    background: #334155;
+  }
+
+  .sync-progress__details {
+    color: #cbd5f5;
+  }
+
+  .sync-progress__path {
+    background: rgba(96, 165, 250, 0.2);
+    color: #e2e8f0;
   }
 }

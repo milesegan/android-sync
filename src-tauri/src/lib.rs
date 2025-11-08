@@ -1,20 +1,69 @@
-use adb_client::{is_adb_device, ADBDeviceExt, ADBUSBDevice, RustADBError};
+use adb_client::{is_adb_device, ADBDeviceExt, ADBUSBDevice, AdbStatResponse, RustADBError};
 use rusb::{Device, UsbContext};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
+use tauri::{Emitter, Window};
 
 #[derive(Debug, Serialize)]
 pub struct SyncSummary {
     device: DeviceDetails,
     files_synced: usize,
+    files_deleted: usize,
     skipped_entries: usize,
     directories_created: usize,
     bytes_uploaded: u64,
     remote_path: String,
     local_root: String,
+    dry_run: bool,
+}
+
+const PROGRESS_EVENT: &str = "sync-progress";
+
+#[derive(Debug, Serialize, Clone)]
+struct SyncProgressPayload {
+    processed_files: usize,
+    total_files: usize,
+    current_file: Option<String>,
+    dry_run: bool,
+}
+
+struct ProgressReporter {
+    window: Window,
+    total_files: usize,
+    processed_files: usize,
+    dry_run: bool,
+}
+
+impl ProgressReporter {
+    fn new(window: Window, total_files: usize, dry_run: bool) -> Self {
+        let reporter = Self {
+            window,
+            total_files,
+            processed_files: 0,
+            dry_run,
+        };
+        reporter.emit(None);
+        reporter
+    }
+
+    fn file_processed(&mut self, current_file: Option<&str>) {
+        self.processed_files = self.processed_files.saturating_add(1);
+        self.emit(current_file);
+    }
+
+    fn emit(&self, current_file: Option<&str>) {
+        let payload = SyncProgressPayload {
+            processed_files: self.processed_files,
+            total_files: self.total_files,
+            current_file: current_file.map(|value| value.to_string()),
+            dry_run: self.dry_run,
+        };
+        let _ = self.window.emit(PROGRESS_EVENT, payload);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -40,30 +89,51 @@ impl From<AndroidDeviceInfo> for DeviceDetails {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![sync_folders])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 
 #[tauri::command]
-async fn sync_folders(local_path: String, device_path: String) -> Result<SyncSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || perform_sync(local_path, device_path))
-        .await
-        .map_err(|e| format!("sync task failed: {e}"))?
-        .map_err(|e| e.to_string())
+async fn sync_folders(
+    window: Window,
+    local_path: String,
+    device_path: String,
+    dry_run: bool,
+) -> Result<SyncSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        perform_sync(window, local_path, device_path, dry_run)
+    })
+    .await
+    .map_err(|e| format!("sync task failed: {e}"))?
+    .map_err(|e| e.to_string())
 }
 
-fn perform_sync(local_path: String, device_path: String) -> Result<SyncSummary, SyncError> {
+fn perform_sync(
+    window: Window,
+    local_path: String,
+    device_path: String,
+    dry_run: bool,
+) -> Result<SyncSummary, SyncError> {
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
+    let total_files = count_local_files(&local_root)?;
 
     let device_info = detect_android_device()?;
     let mut adb_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
 
     let mut created_dirs = HashSet::new();
     let mut stats = SyncStats::default();
+    let mut progress = ProgressReporter::new(window, total_files, dry_run);
 
-    ensure_remote_dir(&mut adb_device, &remote_root, &mut created_dirs, &mut stats)?;
+    ensure_remote_dir(
+        &mut adb_device,
+        &remote_root,
+        &mut created_dirs,
+        &mut stats,
+        dry_run,
+    )?;
     sync_directory(
         &mut adb_device,
         &local_root,
@@ -71,16 +141,20 @@ fn perform_sync(local_path: String, device_path: String) -> Result<SyncSummary, 
         &remote_root,
         &mut created_dirs,
         &mut stats,
+        &mut progress,
+        dry_run,
     )?;
 
     Ok(SyncSummary {
         device: device_info.into(),
         files_synced: stats.files_synced,
+        files_deleted: stats.files_deleted,
         skipped_entries: stats.skipped_entries,
         directories_created: stats.directories_created,
         bytes_uploaded: stats.bytes_uploaded,
         remote_path: remote_root,
         local_root: local_root.display().to_string(),
+        dry_run,
     })
 }
 
@@ -143,27 +217,45 @@ fn sync_directory(
     remote_root: &str,
     created_dirs: &mut HashSet<String>,
     stats: &mut SyncStats,
+    progress: &mut ProgressReporter,
+    dry_run: bool,
 ) -> Result<(), SyncError> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let entry_path = entry.path();
         let metadata = entry.metadata()?;
+
+        if should_skip_entry(&entry_path) {
+            stats.skipped_entries += 1;
+            continue;
+        }
+
         let relative_path = entry_path
             .strip_prefix(root)
             .unwrap_or_else(|_| Path::new(""));
 
         if metadata.is_dir() {
             let remote_dir = build_remote_path(remote_root, relative_path);
-            ensure_remote_dir(device, &remote_dir, created_dirs, stats)?;
-            sync_directory(device, root, &entry_path, remote_root, created_dirs, stats)?;
+            ensure_remote_dir(device, &remote_dir, created_dirs, stats, dry_run)?;
+            sync_directory(
+                device,
+                root,
+                &entry_path,
+                remote_root,
+                created_dirs,
+                stats,
+                progress,
+                dry_run,
+            )?;
         } else if metadata.is_file() {
             let remote_file = build_remote_path(remote_root, relative_path);
             let parent = relative_path
                 .parent()
                 .map(|p| build_remote_path(remote_root, p))
                 .unwrap_or_else(|| remote_root.to_string());
-            ensure_remote_dir(device, &parent, created_dirs, stats)?;
-            push_file(device, &entry_path, &remote_file, metadata.len(), stats)?;
+            ensure_remote_dir(device, &parent, created_dirs, stats, dry_run)?;
+            push_file(device, &entry_path, &remote_file, &metadata, stats, dry_run)?;
+            progress.file_processed(Some(remote_file.as_str()));
         } else {
             stats.skipped_entries += 1;
         }
@@ -176,13 +268,20 @@ fn push_file(
     device: &mut ADBUSBDevice,
     local_path: &Path,
     remote_path: &str,
-    size_hint: u64,
+    metadata: &fs::Metadata,
     stats: &mut SyncStats,
+    dry_run: bool,
 ) -> Result<(), SyncError> {
-    let mut file = File::open(local_path)?;
-    device.push(&mut file, &remote_path)?;
+    if file_is_unchanged(device, remote_path, metadata)? {
+        return Ok(());
+    }
+
+    if !dry_run {
+        let mut file = File::open(local_path)?;
+        device.push(&mut file, &remote_path)?;
+    }
     stats.files_synced += 1;
-    stats.bytes_uploaded += size_hint;
+    stats.bytes_uploaded += metadata.len();
     Ok(())
 }
 
@@ -191,6 +290,7 @@ fn ensure_remote_dir(
     remote_dir: &str,
     created_dirs: &mut HashSet<String>,
     stats: &mut SyncStats,
+    dry_run: bool,
 ) -> Result<(), SyncError> {
     let normalized = if remote_dir == "/" {
         "/".to_string()
@@ -203,12 +303,66 @@ fn ensure_remote_dir(
     }
 
     if normalized != "/" {
-        let mut sink = io::sink();
-        device.shell_command(&["mkdir", "-p", normalized.as_str()], &mut sink)?;
+        if !dry_run {
+            let mut sink = io::sink();
+            device.shell_command(&["mkdir", "-p", normalized.as_str()], &mut sink)?;
+        }
         stats.directories_created += 1;
     }
 
     Ok(())
+}
+
+fn file_is_unchanged(
+    device: &mut ADBUSBDevice,
+    remote_path: &str,
+    metadata: &fs::Metadata,
+) -> Result<bool, SyncError> {
+    let Some(remote) = remote_metadata(device, remote_path)? else {
+        return Ok(false);
+    };
+
+    if u64::from(remote.file_size) != metadata.len() {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn remote_metadata(
+    device: &mut ADBUSBDevice,
+    remote_path: &str,
+) -> Result<Option<AdbStatResponse>, SyncError> {
+    match device.stat(remote_path) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) => match error {
+            RustADBError::ADBRequestFailed(message) => {
+                if adb_missing_file(&message) {
+                    Ok(None)
+                } else {
+                    Err(SyncError::Adb(RustADBError::ADBRequestFailed(message)))
+                }
+            }
+            other => Err(other.into()),
+        },
+    }
+}
+
+fn adb_missing_file(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("failed to lstat")
+        || lower.contains("failed to stat")
+}
+
+fn file_modified_seconds(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
 }
 
 fn build_remote_path(remote_root: &str, relative: &Path) -> String {
@@ -231,6 +385,29 @@ fn build_remote_path(remote_root: &str, relative: &Path) -> String {
     } else {
         format!("{}/{}", remote_root.trim_end_matches('/'), pieces.join("/"))
     }
+}
+
+fn count_local_files(root: &Path) -> Result<usize, SyncError> {
+    let mut total = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if should_skip_entry(&entry.path()) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total += count_local_files(&entry.path())?;
+        } else if metadata.is_file() {
+            total += 1;
+        }
+    }
+    Ok(total)
+}
+
+fn should_skip_entry(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| name.to_string_lossy().starts_with('.'))
+        .unwrap_or(false)
 }
 
 fn detect_android_device() -> Result<AndroidDeviceInfo, SyncError> {
@@ -299,6 +476,7 @@ impl AndroidDeviceInfo {
 #[derive(Default)]
 struct SyncStats {
     files_synced: usize,
+    files_deleted: usize,
     skipped_entries: usize,
     directories_created: usize,
     bytes_uploaded: u64,
