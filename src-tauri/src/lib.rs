@@ -1,7 +1,7 @@
+use adb_client::usb::{find_all_connected_adb_devices, ADBUSBDevice};
 use adb_client::{ADBDeviceExt, AdbStatResponse, RustADBError};
-use adb_client::usb::{ADBUSBDevice, find_all_connected_adb_devices};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -96,6 +96,43 @@ impl From<AndroidDeviceInfo> for DeviceDetails {
     }
 }
 
+#[derive(Debug)]
+struct AndroidDeviceInfo {
+    vendor_id: u16,
+    product_id: u16,
+    manufacturer: Option<String>,
+    product: Option<String>,
+}
+
+impl AndroidDeviceInfo {
+    fn from_adb_device(device: adb_client::usb::ADBDeviceInfo) -> Self {
+        let (manufacturer, product) = split_device_description(device.device_description.as_str());
+        Self {
+            vendor_id: device.vendor_id,
+            product_id: device.product_id,
+            manufacturer,
+            product,
+        }
+    }
+}
+
+struct LocalSyncPlan {
+    directories: Vec<String>,
+    files: Vec<LocalFileEntry>,
+    skipped_entries: usize,
+}
+
+struct LocalFileEntry {
+    local_path: PathBuf,
+    remote_path: String,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteFileMetadata {
+    size_bytes: u64,
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -129,38 +166,37 @@ fn perform_sync(
 ) -> Result<SyncSummary, SyncError> {
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
-    let total_files = count_local_files(&local_root)?;
-    let remote_directories = collect_remote_directories(&local_root, &remote_root)?;
+    let sync_plan = build_sync_plan(&local_root, &remote_root)?;
     let device_info = detect_android_device()?;
+    let total_files = sync_plan.files.len();
 
-    let mut created_dirs = HashSet::new();
-    let mut stats = SyncStats::default();
+    let mut stats = SyncStats {
+        skipped_entries: sync_plan.skipped_entries,
+        ..SyncStats::default()
+    };
     let mut progress = ProgressReporter::new(window, total_files, dry_run);
+    let mut created_dirs = HashSet::new();
+    let mut shell_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
 
     create_remote_directories(
-        &device_info,
-        &remote_directories,
+        &mut shell_device,
+        &sync_plan.directories,
         dry_run,
         &mut created_dirs,
         &mut stats,
         &mut progress,
     )?;
 
+    let remote_files = collect_remote_file_manifest(&mut shell_device, &remote_root);
+    drop(shell_device);
+
     let mut adb_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
 
-    ensure_remote_dir(
+    sync_files(
+        &device_info,
         &mut adb_device,
-        &remote_root,
-        &mut created_dirs,
-        &mut stats,
-        dry_run,
-    )?;
-    sync_directory(
-        &mut adb_device,
-        &local_root,
-        &local_root,
-        &remote_root,
-        &mut created_dirs,
+        &sync_plan.files,
+        remote_files.as_ref(),
         &mut stats,
         &mut progress,
         dry_run,
@@ -233,22 +269,49 @@ fn normalize_remote_path(path: &str) -> Result<String, SyncError> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-fn sync_directory(
-    device: &mut ADBUSBDevice,
+fn build_sync_plan(local_root: &Path, remote_root: &str) -> Result<LocalSyncPlan, SyncError> {
+    let mut directories = HashSet::new();
+    let mut files = Vec::new();
+    let mut skipped_entries = 0;
+
+    directories.insert(normalize_remote_dir_path(remote_root));
+    collect_local_entries(
+        local_root,
+        local_root,
+        remote_root,
+        &mut directories,
+        &mut files,
+        &mut skipped_entries,
+    )?;
+
+    let mut directories: Vec<_> = directories.into_iter().collect();
+    directories.sort_by(|a, b| {
+        directory_depth(a.as_str())
+            .cmp(&directory_depth(b.as_str()))
+            .then_with(|| a.cmp(b))
+    });
+
+    Ok(LocalSyncPlan {
+        directories,
+        files,
+        skipped_entries,
+    })
+}
+
+fn collect_local_entries(
     root: &Path,
     current: &Path,
     remote_root: &str,
-    created_dirs: &mut HashSet<String>,
-    stats: &mut SyncStats,
-    progress: &mut ProgressReporter,
-    dry_run: bool,
+    directories: &mut HashSet<String>,
+    files: &mut Vec<LocalFileEntry>,
+    skipped_entries: &mut usize,
 ) -> Result<(), SyncError> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let entry_path = entry.path();
 
         if should_skip_entry(&entry_path) {
-            stats.skipped_entries += 1;
+            *skipped_entries += 1;
             continue;
         }
 
@@ -259,168 +322,104 @@ fn sync_directory(
 
         if metadata.is_dir() {
             let remote_dir = build_remote_path(remote_root, relative_path);
-            ensure_remote_dir(device, &remote_dir, created_dirs, stats, dry_run)?;
-            sync_directory(
-                device,
+            directories.insert(normalize_remote_dir_path(remote_dir.as_str()));
+            collect_local_entries(
                 root,
                 &entry_path,
                 remote_root,
-                created_dirs,
-                stats,
-                progress,
-                dry_run,
+                directories,
+                files,
+                skipped_entries,
             )?;
         } else if metadata.is_file() {
             let remote_file = build_remote_path(remote_root, relative_path);
-            let parent = relative_path
-                .parent()
-                .map(|p| build_remote_path(remote_root, p))
-                .unwrap_or_else(|| remote_root.to_string());
-            ensure_remote_dir(device, &parent, created_dirs, stats, dry_run)?;
-            push_file(
-                device,
-                &entry_path,
-                remote_file.as_str(),
-                &metadata,
-                stats,
-                dry_run,
-            )?;
-            progress.file_processed(Some(remote_file.as_str()));
+            files.push(LocalFileEntry {
+                local_path: entry_path,
+                remote_path: remote_file,
+                size_bytes: metadata.len(),
+            });
         } else {
-            stats.skipped_entries += 1;
+            *skipped_entries += 1;
         }
+    }
+
+    Ok(())
+}
+
+fn sync_files(
+    device_info: &AndroidDeviceInfo,
+    device: &mut ADBUSBDevice,
+    files: &[LocalFileEntry],
+    remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
+    stats: &mut SyncStats,
+    progress: &mut ProgressReporter,
+    dry_run: bool,
+) -> Result<(), SyncError> {
+    for file in files {
+        push_file(device_info, device, file, remote_files, stats, dry_run)?;
+        progress.file_processed(Some(file.remote_path.as_str()));
     }
 
     Ok(())
 }
 
 fn push_file(
+    device_info: &AndroidDeviceInfo,
     device: &mut ADBUSBDevice,
-    local_path: &Path,
-    remote_path: &str,
-    metadata: &fs::Metadata,
+    file: &LocalFileEntry,
+    remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
     stats: &mut SyncStats,
     dry_run: bool,
 ) -> Result<(), SyncError> {
-    if file_is_unchanged(device, remote_path, metadata)? {
+    if file_is_unchanged(device, file.remote_path.as_str(), file.size_bytes, remote_files)? {
         return Ok(());
     }
 
     if !dry_run {
-        let mut file = File::open(local_path)?;
-        device.push(&mut file, &remote_path)?;
+        let mut local_file = File::open(file.local_path.as_path())?;
+        match device.push(&mut local_file, &file.remote_path) {
+            Ok(()) => {}
+            Err(error)
+                if push_completed_despite_protocol_error(&error, device_info, file)? => {}
+            Err(error) => return Err(error.into()),
+        }
     }
+
     stats.files_synced += 1;
-    stats.bytes_uploaded += metadata.len();
+    stats.bytes_uploaded += file.size_bytes;
     Ok(())
 }
 
-fn ensure_remote_dir(
-    device: &mut ADBUSBDevice,
-    remote_dir: &str,
-    created_dirs: &mut HashSet<String>,
-    stats: &mut SyncStats,
-    dry_run: bool,
-) -> Result<(), SyncError> {
-    let normalized = normalize_remote_dir_path(remote_dir);
+fn push_completed_despite_protocol_error(
+    error: &RustADBError,
+    device_info: &AndroidDeviceInfo,
+    file: &LocalFileEntry,
+) -> Result<bool, SyncError> {
+    let RustADBError::WrongResponseReceived(actual, expected) = error else {
+        return Ok(false);
+    };
 
-    if !created_dirs.insert(normalized.clone()) {
-        return Ok(());
+    if actual != "WRTE" || expected != "OKAY" {
+        return Ok(false);
     }
 
-    if normalized != "/" {
-        if !dry_run {
-            let mut sink = io::sink();
-            device.shell_command(
-                &format!("mkdir -p {}", shell_escape_single_quotes(normalized.as_str())),
-                Some(&mut sink),
-                None,
-            )?;
-        }
-        stats.directories_created += 1;
-    }
+    let mut verification_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
+    let Some(remote) = remote_metadata(&mut verification_device, file.remote_path.as_str())? else {
+        return Ok(false);
+    };
 
-    Ok(())
-}
-
-fn normalize_remote_dir_path(path: &str) -> String {
-    if path == "/" {
-        "/".to_string()
-    } else {
-        path.trim_end_matches('/').to_string()
-    }
-}
-
-fn directory_depth(path: &str) -> usize {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .count()
-}
-
-fn collect_remote_directories(
-    local_root: &Path,
-    remote_root: &str,
-) -> Result<Vec<String>, SyncError> {
-    let mut directories = HashSet::new();
-    directories.insert(normalize_remote_dir_path(remote_root));
-    collect_remote_directories_recursive(local_root, local_root, remote_root, &mut directories)?;
-
-    let mut list: Vec<_> = directories.into_iter().collect();
-    list.sort_by(|a, b| {
-        directory_depth(a.as_str())
-            .cmp(&directory_depth(b.as_str()))
-            .then_with(|| a.cmp(b))
-    });
-    Ok(list)
-}
-
-fn collect_remote_directories_recursive(
-    root: &Path,
-    current: &Path,
-    remote_root: &str,
-    directories: &mut HashSet<String>,
-) -> Result<(), SyncError> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        if should_skip_entry(&path) {
-            continue;
-        }
-
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            let relative = path.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
-            let remote_dir = build_remote_path(remote_root, relative);
-            directories.insert(normalize_remote_dir_path(remote_dir.as_str()));
-            collect_remote_directories_recursive(root, &path, remote_root, directories)?;
-        }
-    }
-
-    Ok(())
+    Ok(u64::from(remote.file_size) == file.size_bytes)
 }
 
 fn create_remote_directories(
-    device_info: &AndroidDeviceInfo,
+    device: &mut ADBUSBDevice,
     directories: &[String],
     dry_run: bool,
     created_dirs: &mut HashSet<String>,
     stats: &mut SyncStats,
     progress: &mut ProgressReporter,
 ) -> Result<(), SyncError> {
-    let needs_device = !dry_run
-        && directories
-            .iter()
-            .any(|dir| normalize_remote_dir_path(dir.as_str()) != "/");
-
-    let mut shell_device = if needs_device {
-        Some(ADBUSBDevice::new(
-            device_info.vendor_id,
-            device_info.product_id,
-        )?)
-    } else {
-        None
-    };
+    let mut pending_directories = Vec::new();
 
     for dir in directories {
         let normalized = normalize_remote_dir_path(dir.as_str());
@@ -432,38 +431,110 @@ fn create_remote_directories(
             continue;
         }
 
-        if let Some(device) = shell_device.as_mut() {
-            if !dry_run {
-                let mut sink = io::sink();
-                device.shell_command(
-                    &format!("mkdir -p {}", shell_escape_single_quotes(normalized.as_str())),
-                    Some(&mut sink),
-                    None,
-                )?;
-            }
-        }
-
+        pending_directories.push(normalized.clone());
         stats.directories_created += 1;
         progress.directory_prepared(normalized.as_str());
+    }
+
+    if !dry_run {
+        batch_create_remote_directories(device, &pending_directories)?;
     }
 
     Ok(())
 }
 
+fn batch_create_remote_directories(
+    device: &mut ADBUSBDevice,
+    directories: &[String],
+) -> Result<(), SyncError> {
+    const MAX_COMMAND_LEN: usize = 6_000;
+
+    let mut command = String::from("mkdir -p");
+    let mut has_pending = false;
+
+    for directory in directories {
+        let escaped = shell_escape_single_quotes(directory.as_str());
+        if has_pending && command.len() + escaped.len() + 1 > MAX_COMMAND_LEN {
+            let mut sink = io::sink();
+            device.shell_command(&command, Some(&mut sink), None)?;
+            command.clear();
+            command.push_str("mkdir -p");
+        }
+
+        command.push(' ');
+        command.push_str(&escaped);
+        has_pending = true;
+    }
+
+    if has_pending {
+        let mut sink = io::sink();
+        device.shell_command(&command, Some(&mut sink), None)?;
+    }
+
+    Ok(())
+}
+
+fn collect_remote_file_manifest(
+    device: &mut ADBUSBDevice,
+    remote_root: &str,
+) -> Option<HashMap<String, RemoteFileMetadata>> {
+    let escaped_root = shell_escape_single_quotes(remote_root);
+    let command = format!(
+        "if [ -d {root} ]; then find {root} -type f -printf '%P\\t%s\\n'; fi",
+        root = escaped_root
+    );
+    let mut output = Vec::new();
+
+    if device
+        .shell_command(&command, Some(&mut output), None)
+        .is_err()
+    {
+        return None;
+    }
+
+    parse_remote_file_manifest(output.as_slice(), remote_root)
+}
+
+fn parse_remote_file_manifest(
+    output: &[u8],
+    remote_root: &str,
+) -> Option<HashMap<String, RemoteFileMetadata>> {
+    let mut files = HashMap::new();
+    let listing = String::from_utf8_lossy(output);
+
+    for line in listing.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (relative_path, size_text) = trimmed.rsplit_once('\t')?;
+        let size_bytes = size_text.parse::<u64>().ok()?;
+        let remote_path = build_remote_path(remote_root, Path::new(relative_path));
+        files.insert(remote_path, RemoteFileMetadata { size_bytes });
+    }
+
+    Some(files)
+}
+
 fn file_is_unchanged(
     device: &mut ADBUSBDevice,
     remote_path: &str,
-    metadata: &fs::Metadata,
+    size_bytes: u64,
+    remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
 ) -> Result<bool, SyncError> {
+    if let Some(remote_files) = remote_files {
+        return Ok(remote_files
+            .get(remote_path)
+            .map(|remote| remote.size_bytes == size_bytes)
+            .unwrap_or(false));
+    }
+
     let Some(remote) = remote_metadata(device, remote_path)? else {
         return Ok(false);
     };
 
-    if u64::from(remote.file_size) != metadata.len() {
-        return Ok(false);
-    }
-
-    Ok(true)
+    Ok(u64::from(remote.file_size) == size_bytes)
 }
 
 fn remote_metadata(
@@ -494,6 +565,21 @@ fn adb_missing_file(message: &str) -> bool {
         || lower.contains("failed to stat")
 }
 
+fn normalize_remote_dir_path(path: &str) -> String {
+    if path == "/" {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
+}
+
+fn directory_depth(path: &str) -> usize {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count()
+}
+
 fn build_remote_path(remote_root: &str, relative: &Path) -> String {
     let mut pieces = Vec::new();
     for component in relative.components() {
@@ -514,23 +600,6 @@ fn build_remote_path(remote_root: &str, relative: &Path) -> String {
     } else {
         format!("{}/{}", remote_root.trim_end_matches('/'), pieces.join("/"))
     }
-}
-
-fn count_local_files(root: &Path) -> Result<usize, SyncError> {
-    let mut total = 0;
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if should_skip_entry(&entry.path()) {
-            continue;
-        }
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            total += count_local_files(&entry.path())?;
-        } else if metadata.is_file() {
-            total += 1;
-        }
-    }
-    Ok(total)
 }
 
 fn should_skip_entry(path: &Path) -> bool {
@@ -554,26 +623,6 @@ fn detect_android_device() -> Result<AndroidDeviceInfo, SyncError> {
                 .map(|info| (info.vendor_id, info.product_id))
                 .collect(),
         )),
-    }
-}
-
-#[derive(Debug)]
-struct AndroidDeviceInfo {
-    vendor_id: u16,
-    product_id: u16,
-    manufacturer: Option<String>,
-    product: Option<String>,
-}
-
-impl AndroidDeviceInfo {
-    fn from_adb_device(device: adb_client::usb::ADBDeviceInfo) -> Self {
-        let (manufacturer, product) = split_device_description(device.device_description.as_str());
-        Self {
-            vendor_id: device.vendor_id,
-            product_id: device.product_id,
-            manufacturer,
-            product,
-        }
     }
 }
 
