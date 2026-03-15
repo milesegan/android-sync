@@ -1,11 +1,10 @@
-use adb_client::{is_adb_device, ADBDeviceExt, ADBUSBDevice, AdbStatResponse, RustADBError};
-use rusb::{Device, UsbContext};
+use adb_client::{ADBDeviceExt, AdbStatResponse, RustADBError};
+use adb_client::usb::{ADBUSBDevice, find_all_connected_adb_devices};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::UNIX_EPOCH;
 use tauri::{Emitter, Window};
 
 #[derive(Debug, Serialize)]
@@ -332,7 +331,11 @@ fn ensure_remote_dir(
     if normalized != "/" {
         if !dry_run {
             let mut sink = io::sink();
-            device.shell_command(&["mkdir", "-p", normalized.as_str()], &mut sink)?;
+            device.shell_command(
+                &format!("mkdir -p {}", shell_escape_single_quotes(normalized.as_str())),
+                Some(&mut sink),
+                None,
+            )?;
         }
         stats.directories_created += 1;
     }
@@ -432,7 +435,11 @@ fn create_remote_directories(
         if let Some(device) = shell_device.as_mut() {
             if !dry_run {
                 let mut sink = io::sink();
-                device.shell_command(&["mkdir", "-p", normalized.as_str()], &mut sink)?;
+                device.shell_command(
+                    &format!("mkdir -p {}", shell_escape_single_quotes(normalized.as_str())),
+                    Some(&mut sink),
+                    None,
+                )?;
             }
         }
 
@@ -463,7 +470,7 @@ fn remote_metadata(
     device: &mut ADBUSBDevice,
     remote_path: &str,
 ) -> Result<Option<AdbStatResponse>, SyncError> {
-    match device.stat(remote_path) {
+    match device.stat(&remote_path) {
         Ok(stat) => Ok(Some(stat)),
         Err(error) => match error {
             RustADBError::ADBRequestFailed(message) => {
@@ -485,14 +492,6 @@ fn adb_missing_file(message: &str) -> bool {
         || lower.contains("does not exist")
         || lower.contains("failed to lstat")
         || lower.contains("failed to stat")
-}
-
-fn file_modified_seconds(metadata: &fs::Metadata) -> Option<u64> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
 }
 
 fn build_remote_path(remote_root: &str, relative: &Path) -> String {
@@ -541,20 +540,10 @@ fn should_skip_entry(path: &Path) -> bool {
 }
 
 fn detect_android_device() -> Result<AndroidDeviceInfo, SyncError> {
-    let devices = rusb::devices()?;
-    let mut matches = Vec::new();
-
-    for device in devices.iter() {
-        let Ok(descriptor) = device.device_descriptor() else {
-            continue;
-        };
-
-        if !is_adb_device(&device, &descriptor) {
-            continue;
-        }
-
-        matches.push(AndroidDeviceInfo::from_usb_device(device, descriptor));
-    }
+    let mut matches: Vec<_> = find_all_connected_adb_devices()?
+        .into_iter()
+        .map(AndroidDeviceInfo::from_adb_device)
+        .collect();
 
     match matches.len() {
         0 => Err(SyncError::DeviceNotFound),
@@ -577,30 +566,34 @@ struct AndroidDeviceInfo {
 }
 
 impl AndroidDeviceInfo {
-    fn from_usb_device<T: UsbContext>(
-        device: Device<T>,
-        descriptor: rusb::DeviceDescriptor,
-    ) -> Self {
-        let vendor_id = descriptor.vendor_id();
-        let product_id = descriptor.product_id();
-
-        let (manufacturer, product) = device
-            .open()
-            .ok()
-            .map(|handle| {
-                let manufacturer = handle.read_manufacturer_string_ascii(&descriptor).ok();
-                let product = handle.read_product_string_ascii(&descriptor).ok();
-                (manufacturer, product)
-            })
-            .unwrap_or((None, None));
-
+    fn from_adb_device(device: adb_client::usb::ADBDeviceInfo) -> Self {
+        let (manufacturer, product) = split_device_description(device.device_description.as_str());
         Self {
-            vendor_id,
-            product_id,
+            vendor_id: device.vendor_id,
+            product_id: device.product_id,
             manufacturer,
             product,
         }
     }
+}
+
+fn split_device_description(description: &str) -> (Option<String>, Option<String>) {
+    let trimmed = description.trim();
+    if trimmed.is_empty() || trimmed == "Unknown device" {
+        return (None, None);
+    }
+
+    match trimmed.split_once(' ') {
+        Some((manufacturer, product)) => (
+            Some(manufacturer.to_string()),
+            Some(product.trim().to_string()),
+        ),
+        None => (Some(trimmed.to_string()), None),
+    }
+}
+
+fn shell_escape_single_quotes(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[derive(Default)]
