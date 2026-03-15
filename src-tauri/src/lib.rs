@@ -176,7 +176,7 @@ fn perform_sync(
     };
     let mut progress = ProgressReporter::new(window, total_files, dry_run);
     let mut created_dirs = HashSet::new();
-    let mut shell_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
+    let mut shell_device = connect_with_retry(device_info.vendor_id, device_info.product_id)?;
 
     create_remote_directories(
         &mut shell_device,
@@ -188,9 +188,8 @@ fn perform_sync(
     )?;
 
     let remote_files = collect_remote_file_manifest(&mut shell_device, &remote_root);
-    drop(shell_device);
 
-    let mut adb_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
+    let mut adb_device = Some(shell_device);
 
     sync_files(
         &device_info,
@@ -348,7 +347,7 @@ fn collect_local_entries(
 
 fn sync_files(
     device_info: &AndroidDeviceInfo,
-    device: &mut ADBUSBDevice,
+    device_opt: &mut Option<ADBUSBDevice>,
     files: &[LocalFileEntry],
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
     stats: &mut SyncStats,
@@ -356,7 +355,7 @@ fn sync_files(
     dry_run: bool,
 ) -> Result<(), SyncError> {
     for file in files {
-        push_file(device_info, device, file, remote_files, stats, dry_run)?;
+        push_file(device_info, device_opt, file, remote_files, stats, dry_run)?;
         progress.file_processed(Some(file.remote_path.as_str()));
     }
 
@@ -365,12 +364,13 @@ fn sync_files(
 
 fn push_file(
     device_info: &AndroidDeviceInfo,
-    device: &mut ADBUSBDevice,
+    device_opt: &mut Option<ADBUSBDevice>,
     file: &LocalFileEntry,
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
     stats: &mut SyncStats,
     dry_run: bool,
 ) -> Result<(), SyncError> {
+    let device = device_opt.as_mut().expect("device should be present");
     if file_is_unchanged(device, file.remote_path.as_str(), file.size_bytes, remote_files)? {
         return Ok(());
     }
@@ -379,9 +379,21 @@ fn push_file(
         let mut local_file = File::open(file.local_path.as_path())?;
         match device.push(&mut local_file, &file.remote_path) {
             Ok(()) => {}
-            Err(error)
-                if push_completed_despite_protocol_error(&error, device_info, file)? => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                // Drop the current device connection before trying to verify
+                device_opt.take();
+                
+                // Reconnect for verification
+                let mut verification_device = connect_with_retry(device_info.vendor_id, device_info.product_id)?;
+                let verified = push_completed_despite_protocol_error(&mut verification_device, &error, file)?;
+                
+                // Store the new connection for future files
+                *device_opt = Some(verification_device);
+
+                if !verified {
+                    return Err(error.into());
+                }
+            }
         }
     }
 
@@ -391,8 +403,8 @@ fn push_file(
 }
 
 fn push_completed_despite_protocol_error(
+    device: &mut ADBUSBDevice,
     error: &RustADBError,
-    device_info: &AndroidDeviceInfo,
     file: &LocalFileEntry,
 ) -> Result<bool, SyncError> {
     let RustADBError::WrongResponseReceived(actual, expected) = error else {
@@ -403,8 +415,7 @@ fn push_completed_despite_protocol_error(
         return Ok(false);
     }
 
-    let mut verification_device = ADBUSBDevice::new(device_info.vendor_id, device_info.product_id)?;
-    let Some(remote) = remote_metadata(&mut verification_device, file.remote_path.as_str())? else {
+    let Some(remote) = remote_metadata(device, file.remote_path.as_str())? else {
         return Ok(false);
     };
 
@@ -623,6 +634,22 @@ fn detect_android_device() -> Result<AndroidDeviceInfo, SyncError> {
                 .map(|info| (info.vendor_id, info.product_id))
                 .collect(),
         )),
+    }
+}
+
+fn connect_with_retry(vendor_id: u16, product_id: u16) -> Result<ADBUSBDevice, SyncError> {
+    let mut retries = 5;
+    loop {
+        match ADBUSBDevice::new(vendor_id, product_id) {
+            Ok(device) => return Ok(device),
+            Err(e) => {
+                if retries == 0 {
+                    return Err(e.into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                retries -= 1;
+            }
+        }
     }
 }
 
