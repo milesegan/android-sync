@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "android-sync",
+  "productName": "Android Sync",
   "version": "0.1.0",
   "identifier": "com.miles.android-sync",
   "build": {

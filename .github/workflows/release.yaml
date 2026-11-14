@@ -1,0 +1,110 @@
+name: "release"
+
+# Push a version tag such as v1.2.3 to build, sign and notarize the Mac app
+# and publish it as a GitHub release for that tag. The tag must match the
+# version in src-tauri/tauri.conf.json, src-tauri/Cargo.toml and package.json.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-mac:
+    permissions:
+      contents: write
+    # Universal rather than aarch64 so the one DMG also runs on Intel Macs.
+    runs-on: macos-latest
+    steps:
+      # Without these the build still succeeds, but the app comes out unsigned
+      # and un-notarized and Gatekeeper refuses to open it, so stop instead.
+      - name: check signing secrets
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/checkout@v6
+
+      - name: check tag matches app version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+          cargo="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-tauri/Cargo.toml | head -n1)"
+          npm="$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          echo "tag ${tag}, tauri.conf.json ${conf}, Cargo.toml ${cargo}, package.json ${npm}"
+          if [ "$tag" != "$conf" ] || [ "$tag" != "$cargo" ] || [ "$tag" != "$npm" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} doesn't match the app version in every file"
+            exit 1
+          fi
+
+      - name: setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+
+      - name: install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # Creates the release as a draft and uploads to it, so a failed build or
+      # notarization never leaves a published release without downloads. The
+      # next step publishes it once everything is attached.
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Android Sync v__VERSION__"
+          releaseBody: "Download the .dmg below, open it, and drag Android Sync to Applications. Works on Apple silicon and Intel Macs."
+          releaseDraft: true
+          prerelease: false
+          tauriScript: pnpm tauri
+          args: --target universal-apple-darwin
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RELEASE_ID}" ]; then
+            echo "tauri-action did not report a release id"
+            exit 1
+          fi
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false -f make_latest=true

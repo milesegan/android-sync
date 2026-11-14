@@ -11,6 +11,13 @@ to, and press **Start sync**. Android Sync talks to the phone directly over USB 
 the ADB protocol, so you don't need Android File Transfer, MTP, or a separate
 `adb` install.
 
+## Download
+
+Get the latest `.dmg` from the
+[releases page](https://github.com/milesegan/android-sync/releases/latest),
+open it, and drag **Android Sync** to Applications. It's signed and notarized,
+and runs on Apple silicon and Intel Macs.
+
 ## What a sync does
 
 - **Copies one way, Mac → phone.** A file is copied when it is missing on the
@@ -115,6 +122,29 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 The app is developed and tested on macOS.
+
+### Releasing
+
+Set the same `version` in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`
+and `package.json`, commit, then tag the commit with that version and push the
+tag, for example:
+
+```bash
+git tag v0.2.0
+```
+
+```bash
+git push origin main v0.2.0
+```
+
+Only tags of the form `v1.2.3` start a release, and the workflow stops if the
+tag doesn't match the version in all three files. The
+[release workflow](.github/workflows/release.yaml) runs the tests, builds a
+universal app, signs and notarizes it, and publishes a GitHub release for the
+tag with the `.dmg` attached. It needs these repository secrets:
+`APPLE_CERTIFICATE` (the Developer ID Application certificate as a base64
+`.p12`), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`,
+`APPLE_PASSWORD` (an app-specific password) and `APPLE_TEAM_ID`.
 
 ## How it's put together
 
