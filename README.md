@@ -21,7 +21,8 @@ and runs on Apple silicon and Intel Macs.
 ## What a sync does
 
 - **Copies one way, Mac → phone.** A file is copied when it is missing on the
-  phone or its size differs from the Mac copy. Everything else is left alone,
+  phone, or its size or modification time differs from the Mac copy. Copied
+  files keep the Mac file's modification time. Everything else is left alone,
   so running it again only copies what changed.
 - **Deletes extra files on the phone** (on by default). After copying, files
   and folders inside the phone folder that aren't on the Mac are removed, so
@@ -55,9 +56,9 @@ and runs on Apple silicon and Intel Macs.
 > top-level folders), where it would remove other apps' files.
 
 > [!NOTE]
-> Files are compared by **size only**. If you edit a file on the Mac and its
-> size happens to stay exactly the same, it won't be copied again. Delete it
-> on the phone, or change the destination folder, to force a fresh copy.
+> Version 1.0.0 and earlier didn't keep modification times, so files they copied
+> are dated 1970 on the phone. The next sync copies those files again once,
+> with the right dates.
 
 ## Using it
 
@@ -160,6 +161,6 @@ front end.
 
 A sync scans the Mac folder, connects to the phone, creates any missing
 folders, lists the files and folders already on the phone with `find`, pushes
-each new or changed file, and then removes extra files with `rm` and empty
+each new or changed file along with its modification time, and then removes extra files with `rm` and empty
 extra folders with `rmdir`. Progress is sent to the
 window as `sync-progress` events.

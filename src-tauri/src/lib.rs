@@ -12,7 +12,7 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use tauri::{webview::PageLoadEvent, Emitter, Manager, RunEvent, State, Window, WindowEvent};
 
 #[derive(Debug, Serialize)]
@@ -158,11 +158,38 @@ struct LocalFileEntry {
     local_path: PathBuf,
     remote_path: String,
     size_bytes: u64,
+    /// Modification time in whole seconds since the Unix epoch.
+    mtime: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct RemoteFileMetadata {
     size_bytes: u64,
+    /// Modification time in whole seconds since the Unix epoch.
+    mtime: u64,
+}
+
+/// FAT formatted SD cards only store even seconds, so a copied file's time
+/// can be a second off the Mac's.
+const MTIME_TOLERANCE_SECS: u64 = 1;
+
+/// A phone file matches when it has the same size and modification time.
+/// Files copied by earlier versions are dated 1970, so they don't match
+/// and are copied again once, with the right date.
+fn remote_file_matches(local: &LocalFileEntry, remote: Option<RemoteFileMetadata>) -> bool {
+    remote.is_some_and(|remote| {
+        remote.size_bytes == local.size_bytes
+            && remote.mtime.abs_diff(u64::from(local.mtime)) <= MTIME_TOLERANCE_SECS
+    })
+}
+
+fn local_mtime(metadata: &fs::Metadata) -> u32 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|age| u32::try_from(age.as_secs()).unwrap_or(u32::MAX))
+        .unwrap_or(0)
 }
 
 /// Files and folders found under the phone folder, keyed by full phone path.
@@ -613,6 +640,7 @@ fn collect_local_entries(
                 local_path: entry_path,
                 remote_path: remote_file,
                 size_bytes: metadata.len(),
+                mtime: local_mtime(&metadata),
             });
         } else {
             skipped_remote_paths.push(build_remote_path(remote_root, relative_path));
@@ -667,12 +695,14 @@ fn push_file(
     cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
     let device = device_opt.as_mut().expect("device should be present");
-    if file_is_unchanged(
-        device,
-        file.remote_path.as_str(),
-        file.size_bytes,
-        remote_files,
-    )? {
+    let remote = match remote_files {
+        Some(remote_files) => remote_files.get(&file.remote_path).copied(),
+        None => remote_metadata(device, &file.remote_path)?.map(|stat| RemoteFileMetadata {
+            size_bytes: u64::from(stat.file_size),
+            mtime: u64::from(stat.mod_time),
+        }),
+    };
+    if remote_file_matches(file, remote) {
         return Ok(());
     }
 
@@ -681,7 +711,7 @@ fn push_file(
             file: File::open(&file.local_path)?,
             cancelled,
         };
-        if let Err(error) = device.push(&mut reader, &file.remote_path) {
+        if let Err(error) = device.push_with_mtime(&mut reader, &file.remote_path, file.mtime) {
             check_cancelled(cancelled)?;
             if !matches!(&error, RustADBError::WrongResponseReceived(actual, expected)
                 if actual == "WRTE" && expected == "OKAY")
@@ -691,12 +721,7 @@ fn push_file(
 
             drop(device_opt.take());
             let mut verification_device = connect_with_retry(device_info, key_path, cancelled)?;
-            if !file_is_unchanged(
-                &mut verification_device,
-                &file.remote_path,
-                file.size_bytes,
-                None,
-            )? {
+            if !remote_size_matches(&mut verification_device, &file.remote_path, file.size_bytes)? {
                 return Err(error.into());
             }
             *device_opt = Some(verification_device);
@@ -759,7 +784,7 @@ fn collect_remote_file_manifest(
 ) -> Result<Option<RemoteManifest>, SyncError> {
     let escaped_root = shell_escape_single_quotes(remote_root);
     let command = format!(
-        "if [ -d {root} ]; then find {root} -type f -printf 'f\\t%P\\t%s\\n'; find {root} -mindepth 1 -type d -printf 'd\\t%P\\t0\\n'; fi",
+        "if [ -d {root} ]; then find {root} -type f -printf 'f\\t%P\\t%s\\t%T@\\n'; find {root} -mindepth 1 -type d -printf 'd\\t%P\\t0\\t0\\n'; fi",
         root = escaped_root
     );
     let mut output = Vec::new();
@@ -771,8 +796,10 @@ fn collect_remote_file_manifest(
     Ok(parse_remote_file_manifest(output.as_slice(), remote_root))
 }
 
-/// Parses `find` output lines of the form `<f|d>\t<relative path>\t<size>`.
-/// Returns `None` if any line is not in that form.
+/// Parses `find` output lines of the form
+/// `<f|d>\t<relative path>\t<size>\t<mtime>`, where mtime is seconds since
+/// the Unix epoch with an optional fraction. Returns `None` if any line is not
+/// in that form.
 fn parse_remote_file_manifest(output: &[u8], remote_root: &str) -> Option<RemoteManifest> {
     let mut manifest = RemoteManifest::default();
     let listing = String::from_utf8_lossy(output);
@@ -784,14 +811,17 @@ fn parse_remote_file_manifest(output: &[u8], remote_root: &str) -> Option<Remote
         }
 
         let (kind, rest) = trimmed.split_once('\t')?;
+        let (rest, mtime_text) = rest.rsplit_once('\t')?;
         let (relative_path, size_text) = rest.rsplit_once('\t')?;
         let remote_path = build_remote_path(remote_root, Path::new(relative_path));
         match kind {
             "f" => {
                 let size_bytes = size_text.parse::<u64>().ok()?;
+                let whole_seconds = mtime_text.split('.').next().unwrap_or(mtime_text);
+                let mtime = whole_seconds.parse::<u64>().ok()?;
                 manifest
                     .files
-                    .insert(remote_path, RemoteFileMetadata { size_bytes });
+                    .insert(remote_path, RemoteFileMetadata { size_bytes, mtime });
             }
             "d" => manifest.directories.push(remote_path),
             _ => return None,
@@ -940,24 +970,14 @@ fn shell_batches(paths: &[String]) -> Vec<Vec<String>> {
     batches
 }
 
-fn file_is_unchanged(
+/// Checks whether a push that reported an error still wrote the whole file.
+fn remote_size_matches(
     device: &mut ADBUSBDevice,
     remote_path: &str,
     size_bytes: u64,
-    remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
 ) -> Result<bool, SyncError> {
-    if let Some(remote_files) = remote_files {
-        return Ok(remote_files
-            .get(remote_path)
-            .map(|remote| remote.size_bytes == size_bytes)
-            .unwrap_or(false));
-    }
-
-    let Some(remote) = remote_metadata(device, remote_path)? else {
-        return Ok(false);
-    };
-
-    Ok(u64::from(remote.file_size) == size_bytes)
+    Ok(remote_metadata(device, remote_path)?
+        .is_some_and(|remote| u64::from(remote.file_size) == size_bytes))
 }
 
 fn remote_metadata(
@@ -1345,6 +1365,7 @@ mod tests {
                     local_path: PathBuf::from(f),
                     remote_path: path(f),
                     size_bytes: 1,
+                    mtime: 0,
                 })
                 .collect(),
             skipped_entries: skipped.len(),
@@ -1354,10 +1375,16 @@ mod tests {
 
     #[test]
     fn parses_files_and_folders_from_find() {
-        let output = b"f\tAlbum/01 Song.flac\t1234\nd\tAlbum\t0\nf\tname\twith tab.mp3\t5\n";
+        let output = b"f\tAlbum/01 Song.flac\t1234\t1700000000.0\nd\tAlbum\t0\t0\nf\tname\twith tab.mp3\t5\t1600000000.123456789\n";
         let manifest = parse_remote_file_manifest(output, "/sdcard/Music").unwrap();
-        assert_eq!(manifest.files["/sdcard/Music/Album/01 Song.flac"].size_bytes, 1234);
-        assert_eq!(manifest.files["/sdcard/Music/name\twith tab.mp3"].size_bytes, 5);
+        assert_eq!(
+            manifest.files["/sdcard/Music/Album/01 Song.flac"],
+            RemoteFileMetadata { size_bytes: 1234, mtime: 1_700_000_000 }
+        );
+        assert_eq!(
+            manifest.files["/sdcard/Music/name\twith tab.mp3"],
+            RemoteFileMetadata { size_bytes: 5, mtime: 1_600_000_000 }
+        );
         assert_eq!(manifest.directories, ["/sdcard/Music/Album"]);
         assert!(parse_remote_file_manifest(b"garbage\n", "/sdcard/Music").is_none());
     }
@@ -1378,7 +1405,7 @@ mod tests {
         ] {
             manifest
                 .files
-                .insert(format!("{root}/{file}"), RemoteFileMetadata { size_bytes: 1 });
+                .insert(format!("{root}/{file}"), RemoteFileMetadata { size_bytes: 1, mtime: 0 });
         }
         manifest.directories = vec![
             format!("{root}/A"),
@@ -1415,6 +1442,27 @@ mod tests {
         assert!(batches.iter().all(|b| b.iter().map(|p| p.len() + 1).sum::<usize>() <= 6_000));
         assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 2000);
         assert_eq!(batches[0][0], "'/sdcard/it'\\''s 0'");
+    }
+
+    #[test]
+    fn compares_size_and_modification_time() {
+        let local = LocalFileEntry {
+            local_path: PathBuf::from("song.mp3"),
+            remote_path: "/sdcard/Music/song.mp3".into(),
+            size_bytes: 100,
+            mtime: 1_700_000_000,
+        };
+        let remote = |size_bytes, mtime| Some(RemoteFileMetadata { size_bytes, mtime });
+
+        assert!(!remote_file_matches(&local, None));
+        assert!(!remote_file_matches(&local, remote(99, 1_700_000_000)));
+        assert!(remote_file_matches(&local, remote(100, 1_700_000_000)));
+        assert!(remote_file_matches(&local, remote(100, 1_700_000_001)));
+        assert!(remote_file_matches(&local, remote(100, 1_699_999_999)));
+        // Same size but a different date: possibly edited, so copy it again.
+        assert!(!remote_file_matches(&local, remote(100, 1_600_000_000)));
+        // Dated 1970 by an older version of the app.
+        assert!(!remote_file_matches(&local, remote(100, 0)));
     }
 
     #[test]

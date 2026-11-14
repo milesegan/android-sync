@@ -122,7 +122,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         Ok(())
     }
 
-    pub(crate) fn push_file<R: std::io::Read>(&mut self, mut reader: R) -> Result<()> {
+    pub(crate) fn push_file<R: std::io::Read>(&mut self, mut reader: R, mtime: u32) -> Result<()> {
         let mut buffer = vec![0; BUFFER_SIZE].into_boxed_slice();
         let amount_read = reader.read(&mut buffer)?;
         let subcommand_data = MessageSubcommand::Data.with_arg(u32::try_from(amount_read)?);
@@ -144,8 +144,8 @@ impl<T: ADBMessageTransport> ADBSession<T> {
 
             match reader.read(&mut buffer) {
                 Ok(0) => {
-                    // Currently file mtime is not forwarded
-                    let subcommand_data = MessageSubcommand::Done.with_arg(0);
+                    // The device applies DONE's argument as the file's mtime.
+                    let subcommand_data = MessageSubcommand::Done.with_arg(mtime);
 
                     let message = ADBTransportMessage::try_new(
                         MessageCommand::Write,

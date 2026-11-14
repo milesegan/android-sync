@@ -13,6 +13,17 @@ use crate::{
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
     pub(crate) fn push<R: Read, A: AsRef<str>>(&mut self, stream: R, path: A) -> Result<()> {
+        self.push_with_mtime(stream, path, 0)
+    }
+
+    /// Push `stream` to `path` and have the device set the file's modification
+    /// time to `mtime` (seconds since the Unix epoch) once it is written.
+    pub(crate) fn push_with_mtime<R: Read, A: AsRef<str>>(
+        &mut self,
+        stream: R,
+        path: A,
+        mtime: u32,
+    ) -> Result<()> {
         let mut session = self.open_synchronization_session()?;
 
         let path_header = format!("{},0777", path.as_ref());
@@ -28,7 +39,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 session.remote_id(),
                 &send_buffer,
             )?)?;
-            session.push_file(stream)?;
+            session.push_file(stream, mtime)?;
             self.end_transaction(&mut session)
         })();
         if result.is_err()

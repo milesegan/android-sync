@@ -101,6 +101,19 @@ impl ADBUSBDevice {
             )),
         }
     }
+
+    /// Push `stream` to `path` on the device and set the file's modification
+    /// time to `mtime`, in seconds since the Unix epoch.
+    ///
+    /// [`ADBDeviceExt::push`] sends 0, which leaves the file dated 1970.
+    pub fn push_with_mtime(
+        &mut self,
+        stream: &mut dyn Read,
+        path: &dyn AsRef<str>,
+        mtime: u32,
+    ) -> Result<()> {
+        self.inner.push_with_mtime(stream, path, mtime)
+    }
 }
 
 impl ADBDeviceExt for ADBUSBDevice {
