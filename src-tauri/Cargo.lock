@@ -63,6 +63,7 @@ name = "android-sync"
 version = "0.1.0"
 dependencies = [
  "adb_client",
+ "rsa",
  "rusb",
  "serde",
  "serde_json",
@@ -70,6 +71,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tempfile",
 ]
 
 [[package]]

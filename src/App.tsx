@@ -21,23 +21,30 @@ type SyncSummary = {
   dry_run: boolean;
 };
 
-type SyncProgressEvent = {
+type SyncPhase =
+  | "scanning"
+  | "connecting"
+  | "creating_directories"
+  | "reading_device_files"
+  | "syncing_files";
+
+type SyncProgress = {
+  phase: SyncPhase;
   processed_files: number;
   total_files: number;
-  current_file?: string | null;
-  dry_run: boolean;
-};
-
-type SyncProgressState = {
-  processedFiles: number;
-  totalFiles: number;
-  currentFile: string | null;
-  dryRun: boolean;
+  current_file: string | null;
 };
 
 const LOCAL_PATH_STORAGE_KEY = "android-sync:lastLocalPath";
 const DEVICE_PATH_STORAGE_KEY = "android-sync:lastDevicePath";
 const PROGRESS_EVENT = "sync-progress";
+const PROGRESS_DETAILS: Record<SyncPhase, string> = {
+  scanning: "Scanning local files…",
+  connecting: "Connecting over USB. Unlock your phone and tap Allow if “Allow USB debugging?” appears.",
+  creating_directories: "Creating folders on your phone…",
+  reading_device_files: "Reading files on your phone…",
+  syncing_files: "Checking files…",
+};
 
 const formatBytes = (bytes: number) => {
   if (bytes < 1024) return `${bytes} B`;
@@ -61,7 +68,7 @@ function App() {
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
   const [summary, setSummary] = useState<SyncSummary | null>(null);
-  const [progress, setProgress] = useState<SyncProgressState | null>(null);
+  const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [localPathHydrated, setLocalPathHydrated] = useState(false);
   const [devicePathHydrated, setDevicePathHydrated] = useState(false);
 
@@ -74,12 +81,10 @@ function App() {
   }, [devicePath, localPath, syncing]);
 
   const progressPercent = useMemo(() => {
-    if (!progress || progress.totalFiles === 0) {
+    if (progress?.phase !== "syncing_files" || progress.total_files === 0) {
       return null;
     }
-    const ratio = progress.totalFiles
-      ? Math.min(progress.processedFiles / progress.totalFiles, 1)
-      : 0;
+    const ratio = progress.processed_files / progress.total_files;
     return Math.round(ratio * 100);
   }, [progress]);
 
@@ -141,14 +146,8 @@ function App() {
     let cancelled = false;
     let unlisten: UnlistenFn | null = null;
 
-    listen<SyncProgressEvent>(PROGRESS_EVENT, (event) => {
-      const payload = event.payload;
-      setProgress({
-        processedFiles: payload.processed_files,
-        totalFiles: payload.total_files,
-        currentFile: payload.current_file ?? null,
-        dryRun: payload.dry_run,
-      });
+    listen<SyncProgress>(PROGRESS_EVENT, (event) => {
+      setProgress(event.payload);
     })
       .then((fn) => {
         if (cancelled) {
@@ -195,13 +194,8 @@ function App() {
     if (!canSync) return;
     setSyncing(true);
     setError("");
-    setProgress({
-      processedFiles: 0,
-      totalFiles: 0,
-      currentFile: null,
-      dryRun,
-    });
-    setStatus(dryRun ? "Simulating sync…" : "Starting USB sync…");
+    setProgress(null);
+    setStatus("");
     try {
       const result = await invoke<SyncSummary>("sync_folders", {
         localPath,
@@ -282,6 +276,7 @@ function App() {
           <button
             type="button"
             className={`dry-run-toggle__button${dryRun ? " dry-run-toggle__button--active" : ""}`}
+            disabled={syncing}
             onClick={() => setDryRun((previous) => !previous)}
           >
             {dryRun ? "Disable dry run" : "Enable dry run"}
@@ -314,12 +309,12 @@ function App() {
               />
             </div>
             <p className="sync-progress__details">
-              {progress && progress.totalFiles > 0
-                ? `Processed ${progress.processedFiles} of ${progress.totalFiles} files`
-                : "Preparing file list…"}
+              {progress?.phase === "syncing_files" && progress.total_files > 0
+                ? `Processed ${progress.processed_files} of ${progress.total_files} files`
+                : PROGRESS_DETAILS[progress?.phase ?? "scanning"]}
             </p>
-            {progress?.currentFile && (
-              <code className="sync-progress__path">{progress.currentFile}</code>
+            {progress?.current_file && (
+              <code className="sync-progress__path">{progress.current_file}</code>
             )}
           </div>
         )}

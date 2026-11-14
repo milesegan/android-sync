@@ -1,3 +1,5 @@
+mod adb_key;
+
 use adb_client::usb::{find_all_connected_adb_devices, ADBUSBDevice};
 use adb_client::{ADBDeviceExt, AdbStatResponse, RustADBError};
 use serde::Serialize;
@@ -5,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use tauri::{Emitter, Window};
+use tauri::{Emitter, Manager, Window};
 
 #[derive(Debug, Serialize)]
 pub struct SyncSummary {
@@ -21,59 +23,50 @@ pub struct SyncSummary {
 }
 
 const PROGRESS_EVENT: &str = "sync-progress";
+const USB_AUTHORIZATION_HELP: &str =
+    "Unlock your phone, start sync again, and tap Allow if “Allow USB debugging?” appears. If there is no prompt, reconnect the USB cable and try again.";
 
 #[derive(Debug, Serialize, Clone)]
 struct SyncProgressPayload {
+    phase: SyncPhase,
     processed_files: usize,
     total_files: usize,
     current_file: Option<String>,
-    dry_run: bool,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum SyncPhase {
+    Scanning,
+    Connecting,
+    CreatingDirectories,
+    ReadingDeviceFiles,
+    SyncingFiles,
 }
 
 struct ProgressReporter {
     window: Window,
     total_files: usize,
     processed_files: usize,
-    dry_run: bool,
 }
 
 impl ProgressReporter {
-    fn new(window: Window, total_files: usize, dry_run: bool) -> Self {
-        let reporter = Self {
+    fn new(window: Window) -> Self {
+        Self {
             window,
-            total_files,
+            total_files: 0,
             processed_files: 0,
-            dry_run,
-        };
-        reporter.emit(None);
-        reporter
+        }
     }
 
-    fn emit(&self, current_file: Option<&str>) {
+    fn emit(&self, phase: SyncPhase, current_file: Option<&str>) {
         let payload = SyncProgressPayload {
+            phase,
             processed_files: self.processed_files,
             total_files: self.total_files,
             current_file: current_file.map(|value| value.to_string()),
-            dry_run: self.dry_run,
         };
         let _ = self.window.emit(PROGRESS_EVENT, payload);
-    }
-
-    fn file_processed(&mut self, current_file: Option<&str>) {
-        if self.processed_files >= self.total_files {
-            self.total_files = self.total_files.saturating_add(1);
-        }
-        self.processed_files = self.processed_files.saturating_add(1);
-        self.emit(current_file);
-    }
-
-    fn directory_prepared(&mut self, directory: &str) {
-        self.emit(Some(directory));
-    }
-
-    fn finish(&mut self) {
-        self.total_files = self.processed_files;
-        self.emit(None);
     }
 }
 
@@ -164,35 +157,48 @@ fn perform_sync(
     device_path: String,
     dry_run: bool,
 ) -> Result<SyncSummary, SyncError> {
+    let mut progress = ProgressReporter::new(window);
+    progress.emit(SyncPhase::Scanning, None);
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
     let sync_plan = build_sync_plan(&local_root, &remote_root)?;
+    progress.total_files = sync_plan.files.len();
+
+    progress.emit(SyncPhase::Connecting, None);
     let device_info = detect_android_device()?;
-    let total_files = sync_plan.files.len();
+    let app_data_dir = progress
+        .window
+        .path()
+        .app_local_data_dir()
+        .map_err(SyncError::AppData)?;
+    let key_path = adb_key::adb_key_path(&app_data_dir).map_err(SyncError::AdbKey)?;
+    let mut shell_device = connect_with_retry(&device_info, &key_path)?;
 
     let mut stats = SyncStats {
         skipped_entries: sync_plan.skipped_entries,
         ..SyncStats::default()
     };
-    let mut progress = ProgressReporter::new(window, total_files, dry_run);
     let mut created_dirs = HashSet::new();
-    let mut shell_device = connect_with_retry(device_info.vendor_id, device_info.product_id)?;
 
+    if !dry_run {
+        progress.emit(SyncPhase::CreatingDirectories, None);
+    }
     create_remote_directories(
         &mut shell_device,
         &sync_plan.directories,
         dry_run,
         &mut created_dirs,
         &mut stats,
-        &mut progress,
     )?;
 
-    let remote_files = collect_remote_file_manifest(&mut shell_device, &remote_root);
+    progress.emit(SyncPhase::ReadingDeviceFiles, None);
+    let remote_files = collect_remote_file_manifest(&mut shell_device, &remote_root)?;
 
     let mut adb_device = Some(shell_device);
 
     sync_files(
         &device_info,
+        &key_path,
         &mut adb_device,
         &sync_plan.files,
         remote_files.as_ref(),
@@ -201,7 +207,7 @@ fn perform_sync(
         dry_run,
     )?;
 
-    progress.finish();
+    progress.emit(SyncPhase::SyncingFiles, None);
 
     Ok(SyncSummary {
         device: device_info.into(),
@@ -347,6 +353,7 @@ fn collect_local_entries(
 
 fn sync_files(
     device_info: &AndroidDeviceInfo,
+    key_path: &Path,
     device_opt: &mut Option<ADBUSBDevice>,
     files: &[LocalFileEntry],
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
@@ -355,8 +362,18 @@ fn sync_files(
     dry_run: bool,
 ) -> Result<(), SyncError> {
     for file in files {
-        push_file(device_info, device_opt, file, remote_files, stats, dry_run)?;
-        progress.file_processed(Some(file.remote_path.as_str()));
+        progress.emit(SyncPhase::SyncingFiles, Some(&file.remote_path));
+        push_file(
+            device_info,
+            key_path,
+            device_opt,
+            file,
+            remote_files,
+            stats,
+            dry_run,
+        )
+        .map_err(|source| SyncError::FileSync(file.remote_path.clone(), Box::new(source)))?;
+        progress.processed_files += 1;
     }
 
     Ok(())
@@ -364,6 +381,7 @@ fn sync_files(
 
 fn push_file(
     device_info: &AndroidDeviceInfo,
+    key_path: &Path,
     device_opt: &mut Option<ADBUSBDevice>,
     file: &LocalFileEntry,
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
@@ -371,29 +389,35 @@ fn push_file(
     dry_run: bool,
 ) -> Result<(), SyncError> {
     let device = device_opt.as_mut().expect("device should be present");
-    if file_is_unchanged(device, file.remote_path.as_str(), file.size_bytes, remote_files)? {
+    if file_is_unchanged(
+        device,
+        file.remote_path.as_str(),
+        file.size_bytes,
+        remote_files,
+    )? {
         return Ok(());
     }
 
     if !dry_run {
         let mut local_file = File::open(file.local_path.as_path())?;
-        match device.push(&mut local_file, &file.remote_path) {
-            Ok(()) => {}
-            Err(error) => {
-                // Drop the current device connection before trying to verify
-                device_opt.take();
-                
-                // Reconnect for verification
-                let mut verification_device = connect_with_retry(device_info.vendor_id, device_info.product_id)?;
-                let verified = push_completed_despite_protocol_error(&mut verification_device, &error, file)?;
-                
-                // Store the new connection for future files
-                *device_opt = Some(verification_device);
-
-                if !verified {
-                    return Err(error.into());
-                }
+        if let Err(error) = device.push(&mut local_file, &file.remote_path) {
+            if !matches!(&error, RustADBError::WrongResponseReceived(actual, expected)
+                if actual == "WRTE" && expected == "OKAY")
+            {
+                return Err(error.into());
             }
+
+            drop(device_opt.take());
+            let mut verification_device = connect_with_retry(device_info, key_path)?;
+            if !file_is_unchanged(
+                &mut verification_device,
+                &file.remote_path,
+                file.size_bytes,
+                None,
+            )? {
+                return Err(error.into());
+            }
+            *device_opt = Some(verification_device);
         }
     }
 
@@ -402,33 +426,12 @@ fn push_file(
     Ok(())
 }
 
-fn push_completed_despite_protocol_error(
-    device: &mut ADBUSBDevice,
-    error: &RustADBError,
-    file: &LocalFileEntry,
-) -> Result<bool, SyncError> {
-    let RustADBError::WrongResponseReceived(actual, expected) = error else {
-        return Ok(false);
-    };
-
-    if actual != "WRTE" || expected != "OKAY" {
-        return Ok(false);
-    }
-
-    let Some(remote) = remote_metadata(device, file.remote_path.as_str())? else {
-        return Ok(false);
-    };
-
-    Ok(u64::from(remote.file_size) == file.size_bytes)
-}
-
 fn create_remote_directories(
     device: &mut ADBUSBDevice,
     directories: &[String],
     dry_run: bool,
     created_dirs: &mut HashSet<String>,
     stats: &mut SyncStats,
-    progress: &mut ProgressReporter,
 ) -> Result<(), SyncError> {
     let mut pending_directories = Vec::new();
 
@@ -444,11 +447,11 @@ fn create_remote_directories(
 
         pending_directories.push(normalized.clone());
         stats.directories_created += 1;
-        progress.directory_prepared(normalized.as_str());
     }
 
     if !dry_run {
-        batch_create_remote_directories(device, &pending_directories)?;
+        batch_create_remote_directories(device, &pending_directories)
+            .map_err(|error| SyncError::AdbOperation("creating device folders", error))?;
     }
 
     Ok(())
@@ -457,7 +460,7 @@ fn create_remote_directories(
 fn batch_create_remote_directories(
     device: &mut ADBUSBDevice,
     directories: &[String],
-) -> Result<(), SyncError> {
+) -> Result<(), RustADBError> {
     const MAX_COMMAND_LEN: usize = 6_000;
 
     let mut command = String::from("mkdir -p");
@@ -488,7 +491,7 @@ fn batch_create_remote_directories(
 fn collect_remote_file_manifest(
     device: &mut ADBUSBDevice,
     remote_root: &str,
-) -> Option<HashMap<String, RemoteFileMetadata>> {
+) -> Result<Option<HashMap<String, RemoteFileMetadata>>, SyncError> {
     let escaped_root = shell_escape_single_quotes(remote_root);
     let command = format!(
         "if [ -d {root} ]; then find {root} -type f -printf '%P\\t%s\\n'; fi",
@@ -496,14 +499,11 @@ fn collect_remote_file_manifest(
     );
     let mut output = Vec::new();
 
-    if device
+    device
         .shell_command(&command, Some(&mut output), None)
-        .is_err()
-    {
-        return None;
-    }
+        .map_err(|error| SyncError::AdbOperation("reading device files", error))?;
 
-    parse_remote_file_manifest(output.as_slice(), remote_root)
+    Ok(parse_remote_file_manifest(output.as_slice(), remote_root))
 }
 
 fn parse_remote_file_manifest(
@@ -637,19 +637,37 @@ fn detect_android_device() -> Result<AndroidDeviceInfo, SyncError> {
     }
 }
 
-fn connect_with_retry(vendor_id: u16, product_id: u16) -> Result<ADBUSBDevice, SyncError> {
+fn connect_with_retry(
+    device: &AndroidDeviceInfo,
+    key_path: &Path,
+) -> Result<ADBUSBDevice, SyncError> {
     let mut retries = 5;
     loop {
-        match ADBUSBDevice::new(vendor_id, product_id) {
+        match ADBUSBDevice::new_with_custom_private_key(
+            device.vendor_id,
+            device.product_id,
+            key_path,
+        ) {
             Ok(device) => return Ok(device),
-            Err(e) => {
-                if retries == 0 {
-                    return Err(e.into());
-                }
+            Err(RustADBError::DeviceBusy) if retries > 0 => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 retries -= 1;
             }
+            Err(error) => return Err(SyncError::AdbConnection(error)),
         }
+    }
+}
+
+fn is_pending_usb_authorization(error: &RustADBError) -> bool {
+    match error {
+        RustADBError::WrongResponseReceived(actual, expected) => {
+            actual == "AUTH" && expected == "CNXN"
+        }
+        // adb_client reports a late authentication packet as a failed session open.
+        RustADBError::ADBRequestFailed(message) => {
+            message == "Open session failed: got AUTH in response instead of OKAY"
+        }
+        _ => false,
     }
 }
 
@@ -688,6 +706,11 @@ enum SyncError {
     DeviceNotFound,
     MultipleDevices(Vec<(u16, u16)>),
     Usb(rusb::Error),
+    AdbKey(io::Error),
+    AppData(tauri::Error),
+    AdbConnection(RustADBError),
+    AdbOperation(&'static str, RustADBError),
+    FileSync(String, Box<SyncError>),
     Adb(RustADBError),
     Io(io::Error),
 }
@@ -709,6 +732,24 @@ impl std::fmt::Display for SyncError {
                 )
             }
             SyncError::Usb(err) => write!(f, "USB error: {err}"),
+            SyncError::AdbKey(err) => write!(f, "Could not prepare the USB debugging key. {err}"),
+            SyncError::AppData(err) => write!(f, "Could not find the app data folder. {err}"),
+            SyncError::AdbConnection(RustADBError::UsbError(rusb::Error::Timeout)) => write!(
+                f,
+                "Android did not respond while connecting over USB. {USB_AUTHORIZATION_HELP}"
+            ),
+            SyncError::AdbConnection(RustADBError::DeviceBusy) => write!(
+                f,
+                "Another app is using the Android USB debugging connection. Close it and try again. If an ADB server is running, stop it with adb kill-server."
+            ),
+            SyncError::AdbConnection(err) | SyncError::AdbOperation(_, err) | SyncError::Adb(err)
+                if is_pending_usb_authorization(err) =>
+            {
+                write!(f, "Android is waiting for USB debugging approval. {USB_AUTHORIZATION_HELP}")
+            }
+            SyncError::AdbConnection(err) => write!(f, "Could not connect to Android over USB. {err}"),
+            SyncError::AdbOperation(operation, err) => write!(f, "ADB error while {operation}. {err}"),
+            SyncError::FileSync(path, err) => write!(f, "Could not sync {path}. {err}"),
             SyncError::Adb(err) => write!(f, "ADB error: {err}"),
             SyncError::Io(err) => write!(f, "File system error: {err}"),
         }
