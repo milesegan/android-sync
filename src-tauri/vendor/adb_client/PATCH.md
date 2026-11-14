@@ -12,3 +12,13 @@ and USB reads have finite timeouts. The file upload path closes the specific
 ADB stream on failure so the app can stop a transfer before releasing USB.
 Switch the app back to the crates.io dependency when a published version
 includes these changes.
+
+## Upstream status
+
+Checked on 2026-11-14: crates.io still has 3.2.3 as its latest release, so
+none of these changes are published. Upstream `main` (eb09aa5) has the single
+bulk write, skips old stream packets during the handshake, and closes a failed
+push's stream when the session is dropped. It still reads USB with no timeout
+by default and waits without a timeout for the first handshake reply. The app
+relies on finite reads so a cancelled connection attempt finishes, so keep the
+timeout change when moving to the next release.
