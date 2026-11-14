@@ -3,11 +3,11 @@
 A small Mac app that copies a folder from your Mac to an Android phone over USB.
 
 <p align="center">
-  <img src="docs/screenshot.png" alt="The Android Sync window: a folder on the Mac, a folder on the phone, a Preview only switch, and a Start sync button" width="486">
+  <img src="docs/screenshot.png" alt="The Android Sync window: a folder on the Mac, a folder on the phone, Delete extra files and Preview only switches, and a Start sync button" width="552">
 </p>
 
-Pick a folder on your Mac, type the folder on the phone it should go to, and
-press **Start sync**. Android Sync talks to the phone directly over USB using
+Pick a folder on your Mac, type the folder on the phone it should mirror it
+to, and press **Start sync**. Android Sync talks to the phone directly over USB using
 the ADB protocol, so you don't need Android File Transfer, MTP, or a separate
 `adb` install.
 
@@ -16,16 +16,36 @@ the ADB protocol, so you don't need Android File Transfer, MTP, or a separate
 - **Copies one way, Mac → phone.** A file is copied when it is missing on the
   phone or its size differs from the Mac copy. Everything else is left alone,
   so running it again only copies what changed.
-- **Never deletes anything on the phone.** Files you removed on the Mac stay
-  on the phone.
+- **Deletes extra files on the phone** (on by default). After copying, files
+  and folders inside the phone folder that aren't on the Mac are removed, so
+  the phone folder matches the Mac folder. Turn off **Delete extra files** to
+  only add and update files.
 - **Creates folders** on the phone to match the folder structure on the Mac.
 - **Skips dotfiles** such as `.DS_Store`, and anything that isn't a regular
   file or folder (symlinks, for example).
-- **Preview only** runs the same check without copying, and reports how many
-  files and bytes a real sync would transfer.
+- **Preview only** runs the same check without copying or deleting, and
+  reports how many files a real sync would copy and delete, and how many bytes
+  it would transfer.
 - **Cancel** stops a sync at any point, including while waiting for the phone
   to approve the connection. The file being copied when you cancel is removed
   by the phone, and the next sync copies it again.
+
+> [!WARNING]
+> With **Delete extra files** on, anything in the phone folder that isn't in
+> the Mac folder is deleted, including files other apps saved there. Use a
+> folder that only Android Sync writes to, and run **Preview only** first if
+> you're unsure. A few things are always kept:
+>
+> - Hidden files and folders on the phone, such as `.nomedia` and
+>   `.thumbnails`.
+> - Anything matching a dotfile, symlink or other entry that was skipped on
+>   the Mac.
+> - Names are compared without case, so `Song.mp3` on the Mac keeps
+>   `song.mp3` on the phone.
+>
+> Deleting is refused for the top of shared storage and similar folders
+> (`/`, `/sdcard`, `/storage/emulated/0`, `/sdcard/Android` and other
+> top-level folders), where it would remove other apps' files.
 
 > [!NOTE]
 > Files are compared by **size only**. If you edit a file on the Mac and its
@@ -60,6 +80,7 @@ Otherwise it creates its own key in the app's data folder and keeps reusing it.
 | *No Android device detected over USB* | Check the cable, unlock the phone, and make sure USB debugging is on. Some cables only charge. |
 | *Multiple Android devices detected* | Unplug all but one phone. |
 | *Android is waiting for USB debugging approval* or *Android did not respond* | Unlock the phone and tap **Allow** on the prompt. If no prompt appears, reconnect the cable and try again. |
+| *Deleting extra files isn't allowed in …* | The phone folder is the top of shared storage or another system folder. Choose a folder inside it, for example `/sdcard/Music`, or turn off **Delete extra files**. |
 | *Another app is using the Android USB debugging connection* | Only one program can use the phone's debugging connection at a time. Quit Android Studio, scrcpy and similar tools, and stop any running ADB server with `adb kill-server`. |
 
 ## Building from source
@@ -103,11 +124,12 @@ front end.
 | Path | What's there |
 | --- | --- |
 | `src/App.tsx`, `src/App.css` | The whole user interface |
-| `src-tauri/src/lib.rs` | The sync: scanning the folder, connecting over USB, comparing against the phone and copying files |
+| `src-tauri/src/lib.rs` | The sync: scanning the folder, connecting over USB, comparing against the phone, copying and deleting files |
 | `src-tauri/src/adb_key.rs` | Finding or creating the USB debugging key |
 | `src-tauri/vendor/adb_client` | A patched copy of the [`adb_client`](https://github.com/cocool97/adb_client) crate with faster USB writes and better recovery from interrupted transfers (see its `PATCH.md`) |
 
 A sync scans the Mac folder, connects to the phone, creates any missing
-folders, lists the files already on the phone with their sizes in one shell
-command, and then pushes each new or changed file. Progress is sent to the
+folders, lists the files and folders already on the phone with `find`, pushes
+each new or changed file, and then removes extra files with `rm` and empty
+extra folders with `rmdir`. Progress is sent to the
 window as `sync-progress` events.

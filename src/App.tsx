@@ -20,6 +20,7 @@ type SyncSummary = {
   remote_path: string;
   local_root: string;
   dry_run: boolean;
+  delete_extra: boolean;
 };
 
 /** Error value of `sync_folders`, see `SyncFailure` in lib.rs. */
@@ -28,6 +29,7 @@ type SyncFailure =
       kind: "cancelled";
       dry_run: boolean;
       files_synced: number;
+      files_deleted: number;
       processed_files: number;
       total_files: number;
     }
@@ -40,7 +42,8 @@ type SyncPhase =
   | "connecting"
   | "creating_directories"
   | "reading_device_files"
-  | "syncing_files";
+  | "syncing_files"
+  | "deleting_files";
 
 type SyncProgress = {
   phase: SyncPhase;
@@ -56,6 +59,7 @@ type Outcome =
 
 const LOCAL_PATH_STORAGE_KEY = "android-sync:lastLocalPath";
 const DEVICE_PATH_STORAGE_KEY = "android-sync:lastDevicePath";
+const DELETE_EXTRA_STORAGE_KEY = "android-sync:deleteExtra";
 const DEFAULT_DEVICE_PATH = "/sdcard/AndroidSync";
 const PROGRESS_EVENT = "sync-progress";
 
@@ -65,6 +69,7 @@ const PHASE_HEADINGS: Record<SyncPhase, string> = {
   creating_directories: "Creating folders",
   reading_device_files: "Reading files on your phone",
   syncing_files: "Copying files",
+  deleting_files: "Deleting extra files",
 };
 
 const PHASE_DETAILS: Partial<Record<SyncPhase, string>> = {
@@ -143,6 +148,9 @@ function App() {
     readStored(DEVICE_PATH_STORAGE_KEY, DEFAULT_DEVICE_PATH)
   );
   const [dryRun, setDryRun] = useState(false);
+  const [deleteExtra, setDeleteExtra] = useState(
+    () => readStored(DELETE_EXTRA_STORAGE_KEY, "true") !== "false"
+  );
   const [syncing, setSyncing] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
@@ -152,6 +160,7 @@ function App() {
 
   useEffect(() => writeStored(LOCAL_PATH_STORAGE_KEY, localPath), [localPath]);
   useEffect(() => writeStored(DEVICE_PATH_STORAGE_KEY, devicePath), [devicePath]);
+  useEffect(() => writeStored(DELETE_EXTRA_STORAGE_KEY, String(deleteExtra)), [deleteExtra]);
 
   useEffect(() => {
     homeDir()
@@ -214,6 +223,7 @@ function App() {
         localPath,
         devicePath,
         dryRun,
+        deleteExtra,
       });
       setOutcome({ kind: "complete", summary });
     } catch (err) {
@@ -228,7 +238,7 @@ function App() {
       setStopping(false);
       setProgress(null);
     }
-  }, [devicePath, dryRun, hasDevicePath, hasLocalPath, localPath, syncing]);
+  }, [deleteExtra, devicePath, dryRun, hasDevicePath, hasLocalPath, localPath, syncing]);
 
   const cancelSync = useCallback(async () => {
     setStopping(true);
@@ -305,29 +315,27 @@ function App() {
           </div>
         </div>
 
-        <div className="option">
-          <div className="option__text">
-            <span className="option__title" id="preview-label">
-              Preview only
-            </span>
-            <span className="option__hint" id="preview-hint">
-              List changes without copying
-            </span>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            className="switch"
-            aria-checked={dryRun}
-            aria-labelledby="preview-label"
-            aria-describedby="preview-hint"
-            onClick={() => {
-              setDryRun((previous) => !previous);
+        <div className="options">
+          <SwitchRow
+            id="delete-extra"
+            title="Delete extra files"
+            hint="Remove files on your phone that aren't on this Mac"
+            checked={deleteExtra}
+            onChange={(value) => {
+              setDeleteExtra(value);
               setOutcome(null);
             }}
-          >
-            <span className="switch__thumb" />
-          </button>
+          />
+          <SwitchRow
+            id="preview"
+            title="Preview only"
+            hint="List changes without copying or deleting"
+            checked={dryRun}
+            onChange={(value) => {
+              setDryRun(value);
+              setOutcome(null);
+            }}
+          />
         </div>
       </fieldset>
 
@@ -389,6 +397,44 @@ function App() {
         )}
       </section>
     </main>
+  );
+}
+
+function SwitchRow({
+  id,
+  title,
+  hint,
+  checked,
+  onChange,
+}: {
+  id: string;
+  title: string;
+  hint: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="option">
+      <div className="option__text">
+        <span className="option__title" id={`${id}-label`}>
+          {title}
+        </span>
+        <span className="option__hint" id={`${id}-hint`}>
+          {hint}
+        </span>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        className="switch"
+        aria-checked={checked}
+        aria-labelledby={`${id}-label`}
+        aria-describedby={`${id}-hint`}
+        onClick={() => onChange(!checked)}
+      >
+        <span className="switch__thumb" />
+      </button>
+    </div>
   );
 }
 
@@ -470,7 +516,10 @@ function CompletePanel({ summary }: { summary: SyncSummary }) {
   const tiles = [
     { value: summary.files_synced.toLocaleString(), label: preview ? "Files to copy" : "Files copied" },
     { value: formatBytes(summary.bytes_uploaded), label: preview ? "To transfer" : "Transferred" },
-    { value: summary.files_deleted.toLocaleString(), label: preview ? "To delete" : "Deleted" },
+    {
+      value: summary.delete_extra ? summary.files_deleted.toLocaleString() : "Off",
+      label: preview ? "To delete" : "Deleted",
+    },
     { value: summary.skipped_entries.toLocaleString(), label: "Skipped" },
   ];
 
@@ -500,13 +549,17 @@ function StoppedNotice({ info }: { info: StoppedInfo }) {
     text = checkedAny
       ? `Checked ${info.processed_files.toLocaleString()} of ${plural(info.total_files, "file")}.`
       : "Stopped before any files were checked.";
-  } else if (checkedAny) {
-    text = `Checked ${info.processed_files.toLocaleString()} of ${plural(
-      info.total_files,
-      "file"
-    )} and copied ${info.files_synced.toLocaleString()}. Start again to pick up where it left off.`;
   } else {
-    text = "Stopped before any files were copied.";
+    const deleted =
+      info.files_deleted > 0 ? `, and deleted ${plural(info.files_deleted, "extra file")}` : "";
+    text = checkedAny
+      ? `Checked ${info.processed_files.toLocaleString()} of ${plural(
+          info.total_files,
+          "file"
+        )} and copied ${info.files_synced.toLocaleString()}${deleted}. Start again to pick up where it left off.`
+      : info.files_deleted > 0
+        ? `Deleted ${plural(info.files_deleted, "extra file")} before stopping.`
+        : "Stopped before any files were copied.";
   }
 
   return (

@@ -26,6 +26,7 @@ pub struct SyncSummary {
     remote_path: String,
     local_root: String,
     dry_run: bool,
+    delete_extra: bool,
 }
 
 /// Why `sync_folders` did not return a summary. The frontend tells a user stop
@@ -36,6 +37,7 @@ enum SyncFailure {
     Cancelled {
         dry_run: bool,
         files_synced: usize,
+        files_deleted: usize,
         processed_files: usize,
         total_files: usize,
     },
@@ -75,6 +77,7 @@ enum SyncPhase {
     CreatingDirectories,
     ReadingDeviceFiles,
     SyncingFiles,
+    DeletingFiles,
 }
 
 struct ProgressReporter {
@@ -146,6 +149,9 @@ struct LocalSyncPlan {
     directories: Vec<String>,
     files: Vec<LocalFileEntry>,
     skipped_entries: usize,
+    /// Phone paths of local entries that were not synced. Matching files on
+    /// the phone are kept rather than treated as extra.
+    skipped_remote_paths: Vec<String>,
 }
 
 struct LocalFileEntry {
@@ -157,6 +163,21 @@ struct LocalFileEntry {
 #[derive(Clone, Copy)]
 struct RemoteFileMetadata {
     size_bytes: u64,
+}
+
+/// Files and folders found under the phone folder, keyed by full phone path.
+#[derive(Default)]
+struct RemoteManifest {
+    files: HashMap<String, RemoteFileMetadata>,
+    directories: Vec<String>,
+}
+
+/// What deleting extra files would remove from the phone.
+#[derive(Debug, Default, PartialEq)]
+struct DeletionPlan {
+    files: Vec<String>,
+    /// Deepest first, so a folder comes before its parent.
+    directories: Vec<String>,
 }
 
 #[derive(Default)]
@@ -312,6 +333,7 @@ async fn sync_folders(
     local_path: String,
     device_path: String,
     dry_run: bool,
+    delete_extra: bool,
     state: State<'_, Mutex<SyncState>>,
 ) -> Result<SyncSummary, SyncFailure> {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -336,12 +358,14 @@ async fn sync_folders(
             local_path,
             device_path,
             dry_run,
+            delete_extra,
             &cancelled,
         );
         result.map_err(|error| match error {
             SyncError::Cancelled => SyncFailure::Cancelled {
                 dry_run,
                 files_synced: stats.files_synced,
+                files_deleted: stats.files_deleted,
                 processed_files: progress.processed_files,
                 total_files: progress.total_files,
             },
@@ -373,11 +397,15 @@ fn perform_sync(
     local_path: String,
     device_path: String,
     dry_run: bool,
+    delete_extra: bool,
     cancelled: &AtomicBool,
 ) -> Result<SyncSummary, SyncError> {
     progress.emit(SyncPhase::Scanning, None);
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
+    if delete_extra && is_protected_remote_root(&remote_root) {
+        return Err(SyncError::ProtectedDeleteRoot(remote_root));
+    }
     let sync_plan = build_sync_plan(&local_root, &remote_root, cancelled)?;
     progress.total_files = sync_plan.files.len();
     stats.skipped_entries = sync_plan.skipped_entries;
@@ -410,7 +438,7 @@ fn perform_sync(
 
     progress.emit(SyncPhase::ReadingDeviceFiles, None);
     check_cancelled(cancelled)?;
-    let remote_files = collect_remote_file_manifest(&mut shell_device, &remote_root)?;
+    let remote_manifest = collect_remote_file_manifest(&mut shell_device, &remote_root)?;
 
     let mut adb_device = Some(shell_device);
 
@@ -419,12 +447,26 @@ fn perform_sync(
         &key_path,
         &mut adb_device,
         &sync_plan.files,
-        remote_files.as_ref(),
+        remote_manifest.as_ref().map(|manifest| &manifest.files),
         stats,
         progress,
         dry_run,
         cancelled,
     )?;
+
+    if delete_extra {
+        check_cancelled(cancelled)?;
+        let remote_manifest = remote_manifest.ok_or(SyncError::UnreadableDeviceListing)?;
+        let deletions = plan_deletions(&sync_plan, &remote_root, &remote_manifest);
+        if !dry_run && !(deletions.files.is_empty() && deletions.directories.is_empty()) {
+            progress.emit(SyncPhase::DeletingFiles, None);
+            let device = adb_device.as_mut().expect("device should be present");
+            delete_remote_entries(device, &deletions, stats, cancelled)
+                .map_err(|error| SyncError::adb_operation("deleting extra files", error))?;
+        } else {
+            stats.files_deleted = deletions.files.len();
+        }
+    }
 
     progress.emit(SyncPhase::SyncingFiles, None);
 
@@ -438,6 +480,7 @@ fn perform_sync(
         remote_path: remote_root,
         local_root: local_root.display().to_string(),
         dry_run,
+        delete_extra,
     })
 }
 
@@ -500,7 +543,7 @@ fn build_sync_plan(
 ) -> Result<LocalSyncPlan, SyncError> {
     let mut directories = HashSet::new();
     let mut files = Vec::new();
-    let mut skipped_entries = 0;
+    let mut skipped_remote_paths = Vec::new();
 
     directories.insert(normalize_remote_dir_path(remote_root));
     collect_local_entries(
@@ -509,7 +552,7 @@ fn build_sync_plan(
         remote_root,
         &mut directories,
         &mut files,
-        &mut skipped_entries,
+        &mut skipped_remote_paths,
         cancelled,
     )?;
 
@@ -523,7 +566,8 @@ fn build_sync_plan(
     Ok(LocalSyncPlan {
         directories,
         files,
-        skipped_entries,
+        skipped_entries: skipped_remote_paths.len(),
+        skipped_remote_paths,
     })
 }
 
@@ -533,23 +577,23 @@ fn collect_local_entries(
     remote_root: &str,
     directories: &mut HashSet<String>,
     files: &mut Vec<LocalFileEntry>,
-    skipped_entries: &mut usize,
+    skipped_remote_paths: &mut Vec<String>,
     cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
     for entry in fs::read_dir(current)? {
         check_cancelled(cancelled)?;
         let entry = entry?;
         let entry_path = entry.path();
+        let relative_path = entry_path
+            .strip_prefix(root)
+            .unwrap_or_else(|_| Path::new(""));
 
         if should_skip_entry(&entry_path) {
-            *skipped_entries += 1;
+            skipped_remote_paths.push(build_remote_path(remote_root, relative_path));
             continue;
         }
 
         let metadata = entry.metadata()?;
-        let relative_path = entry_path
-            .strip_prefix(root)
-            .unwrap_or_else(|_| Path::new(""));
 
         if metadata.is_dir() {
             let remote_dir = build_remote_path(remote_root, relative_path);
@@ -560,7 +604,7 @@ fn collect_local_entries(
                 remote_root,
                 directories,
                 files,
-                skipped_entries,
+                skipped_remote_paths,
                 cancelled,
             )?;
         } else if metadata.is_file() {
@@ -571,7 +615,7 @@ fn collect_local_entries(
                 size_bytes: metadata.len(),
             });
         } else {
-            *skipped_entries += 1;
+            skipped_remote_paths.push(build_remote_path(remote_root, relative_path));
         }
     }
 
@@ -701,42 +745,21 @@ fn batch_create_remote_directories(
     directories: &[String],
     cancelled: &AtomicBool,
 ) -> Result<(), RustADBError> {
-    const MAX_COMMAND_LEN: usize = 6_000;
-
-    let mut command = String::from("mkdir -p");
-    let mut has_pending = false;
-
-    for directory in directories {
-        let escaped = shell_escape_single_quotes(directory.as_str());
-        if has_pending && command.len() + escaped.len() + 1 > MAX_COMMAND_LEN {
-            check_cancelled_io(cancelled)?;
-            let mut sink = io::sink();
-            device.shell_command(&command, Some(&mut sink), None)?;
-            command.clear();
-            command.push_str("mkdir -p");
-        }
-
-        command.push(' ');
-        command.push_str(&escaped);
-        has_pending = true;
-    }
-
-    if has_pending {
+    for batch in shell_batches(directories) {
         check_cancelled_io(cancelled)?;
         let mut sink = io::sink();
-        device.shell_command(&command, Some(&mut sink), None)?;
+        device.shell_command(&format!("mkdir -p {}", batch.join(" ")), Some(&mut sink), None)?;
     }
-
     Ok(())
 }
 
 fn collect_remote_file_manifest(
     device: &mut ADBUSBDevice,
     remote_root: &str,
-) -> Result<Option<HashMap<String, RemoteFileMetadata>>, SyncError> {
+) -> Result<Option<RemoteManifest>, SyncError> {
     let escaped_root = shell_escape_single_quotes(remote_root);
     let command = format!(
-        "if [ -d {root} ]; then find {root} -type f -printf '%P\\t%s\\n'; fi",
+        "if [ -d {root} ]; then find {root} -type f -printf 'f\\t%P\\t%s\\n'; find {root} -mindepth 1 -type d -printf 'd\\t%P\\t0\\n'; fi",
         root = escaped_root
     );
     let mut output = Vec::new();
@@ -748,26 +771,173 @@ fn collect_remote_file_manifest(
     Ok(parse_remote_file_manifest(output.as_slice(), remote_root))
 }
 
-fn parse_remote_file_manifest(
-    output: &[u8],
-    remote_root: &str,
-) -> Option<HashMap<String, RemoteFileMetadata>> {
-    let mut files = HashMap::new();
+/// Parses `find` output lines of the form `<f|d>\t<relative path>\t<size>`.
+/// Returns `None` if any line is not in that form.
+fn parse_remote_file_manifest(output: &[u8], remote_root: &str) -> Option<RemoteManifest> {
+    let mut manifest = RemoteManifest::default();
     let listing = String::from_utf8_lossy(output);
 
     for line in listing.lines() {
-        let trimmed = line.trim_end();
+        let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
             continue;
         }
 
-        let (relative_path, size_text) = trimmed.rsplit_once('\t')?;
-        let size_bytes = size_text.parse::<u64>().ok()?;
+        let (kind, rest) = trimmed.split_once('\t')?;
+        let (relative_path, size_text) = rest.rsplit_once('\t')?;
         let remote_path = build_remote_path(remote_root, Path::new(relative_path));
-        files.insert(remote_path, RemoteFileMetadata { size_bytes });
+        match kind {
+            "f" => {
+                let size_bytes = size_text.parse::<u64>().ok()?;
+                manifest
+                    .files
+                    .insert(remote_path, RemoteFileMetadata { size_bytes });
+            }
+            "d" => manifest.directories.push(remote_path),
+            _ => return None,
+        }
     }
 
-    Some(files)
+    Some(manifest)
+}
+
+/// Phone folders where deleting everything that isn't on the Mac would wipe
+/// shared storage or app data.
+fn is_protected_remote_root(remote_root: &str) -> bool {
+    const PROTECTED: &[&str] = &[
+        "/sdcard/Android",
+        "/storage/emulated",
+        "/storage/emulated/0",
+        "/storage/emulated/0/Android",
+        "/storage/self",
+        "/storage/self/primary",
+        "/storage/self/primary/Android",
+        "/mnt/sdcard",
+        "/mnt/sdcard/Android",
+        "/data/local",
+        "/data/local/tmp",
+    ];
+    directory_depth(remote_root) <= 1
+        || PROTECTED
+            .iter()
+            .any(|protected| protected.eq_ignore_ascii_case(remote_root))
+}
+
+/// Works out which files and folders on the phone have no counterpart on the
+/// Mac. Names are compared without case, because both the Mac and Android
+/// shared storage usually treat names that differ only in case as the same
+/// file. Hidden entries and anything matching a skipped local entry are kept.
+fn plan_deletions(
+    plan: &LocalSyncPlan,
+    remote_root: &str,
+    manifest: &RemoteManifest,
+) -> DeletionPlan {
+    let keep: HashSet<String> = plan
+        .files
+        .iter()
+        .map(|file| file.remote_path.to_lowercase())
+        .chain(plan.directories.iter().map(|dir| dir.to_lowercase()))
+        .collect();
+    let skipped: HashSet<String> = plan
+        .skipped_remote_paths
+        .iter()
+        .map(|path| path.to_lowercase())
+        .collect();
+    let should_delete = |path: &String| {
+        let lower = path.to_lowercase();
+        !keep.contains(&lower)
+            && !is_hidden_below(path, remote_root)
+            && !is_at_or_below_any(&lower, &skipped)
+    };
+
+    let mut files: Vec<String> = manifest.files.keys().filter(|path| should_delete(path)).cloned().collect();
+    files.sort();
+    let mut directories: Vec<String> = manifest
+        .directories
+        .iter()
+        .filter(|path| should_delete(path))
+        .cloned()
+        .collect();
+    directories.sort_by(|a, b| {
+        directory_depth(b)
+            .cmp(&directory_depth(a))
+            .then_with(|| a.cmp(b))
+    });
+
+    DeletionPlan { files, directories }
+}
+
+fn is_hidden_below(path: &str, remote_root: &str) -> bool {
+    let relative = path
+        .strip_prefix(remote_root.trim_end_matches('/'))
+        .unwrap_or(path);
+    relative
+        .split('/')
+        .any(|component| component.starts_with('.'))
+}
+
+fn is_at_or_below_any(path: &str, ancestors: &HashSet<String>) -> bool {
+    let mut current = path;
+    loop {
+        if ancestors.contains(current) {
+            return true;
+        }
+        match current.rfind('/') {
+            Some(index) if index > 0 => current = &current[..index],
+            _ => return false,
+        }
+    }
+}
+
+fn delete_remote_entries(
+    device: &mut ADBUSBDevice,
+    deletions: &DeletionPlan,
+    stats: &mut SyncStats,
+    cancelled: &AtomicBool,
+) -> Result<(), RustADBError> {
+    for batch in shell_batches(&deletions.files) {
+        check_cancelled_io(cancelled)?;
+        let command = format!("rm -f {}", batch.join(" "));
+        let mut sink = io::sink();
+        let status = device.shell_command(&command, Some(&mut sink), Some(&mut io::sink()))?;
+        if let Some(code) = status.filter(|code| *code != 0) {
+            return Err(RustADBError::IOError(io::Error::other(format!(
+                "rm exited with status {code}"
+            ))));
+        }
+        stats.files_deleted += batch.len();
+    }
+
+    // Folders that still hold hidden files fail to delete and are left alone.
+    for batch in shell_batches(&deletions.directories) {
+        check_cancelled_io(cancelled)?;
+        let command = format!("rmdir {} 2>/dev/null; true", batch.join(" "));
+        let mut sink = io::sink();
+        device.shell_command(&command, Some(&mut sink), None)?;
+    }
+
+    Ok(())
+}
+
+/// Splits paths into shell-quoted groups that keep each command short.
+fn shell_batches(paths: &[String]) -> Vec<Vec<String>> {
+    const MAX_COMMAND_LEN: usize = 6_000;
+    let mut batches = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut length = 0;
+    for path in paths {
+        let escaped = shell_escape_single_quotes(path);
+        if !current.is_empty() && length + escaped.len() + 1 > MAX_COMMAND_LEN {
+            batches.push(std::mem::take(&mut current));
+            length = 0;
+        }
+        length += escaped.len() + 1;
+        current.push(escaped);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
 }
 
 fn file_is_unchanged(
@@ -1017,6 +1187,8 @@ enum SyncError {
     AdbConnection(RustADBError),
     AdbOperation(&'static str, RustADBError),
     FileSync(String, Box<SyncError>),
+    ProtectedDeleteRoot(String),
+    UnreadableDeviceListing,
     Adb(RustADBError),
     Io(io::Error),
 }
@@ -1062,6 +1234,14 @@ impl std::fmt::Display for SyncError {
             SyncError::AdbConnection(err) => write!(f, "Could not connect to Android over USB. {err}"),
             SyncError::AdbOperation(operation, err) => write!(f, "ADB error while {operation}. {err}"),
             SyncError::FileSync(path, err) => write!(f, "Could not sync {path}. {err}"),
+            SyncError::ProtectedDeleteRoot(path) => write!(
+                f,
+                "Deleting extra files isn't allowed in {path}, because it would remove files that belong to other apps. Choose a folder inside it, or turn off Delete extra files."
+            ),
+            SyncError::UnreadableDeviceListing => write!(
+                f,
+                "Files were copied, but the list of files on your phone could not be read, so nothing was deleted."
+            ),
             SyncError::Adb(err) => write!(f, "ADB error: {err}"),
             SyncError::Io(err) => write!(f, "File system error: {err}"),
         }
@@ -1153,11 +1333,96 @@ mod tests {
         }
     }
 
+    fn local_plan(root: &str, files: &[&str], dirs: &[&str], skipped: &[&str]) -> LocalSyncPlan {
+        let path = |p: &str| format!("{root}/{p}");
+        LocalSyncPlan {
+            directories: std::iter::once(root.to_string())
+                .chain(dirs.iter().map(|d| path(d)))
+                .collect(),
+            files: files
+                .iter()
+                .map(|f| LocalFileEntry {
+                    local_path: PathBuf::from(f),
+                    remote_path: path(f),
+                    size_bytes: 1,
+                })
+                .collect(),
+            skipped_entries: skipped.len(),
+            skipped_remote_paths: skipped.iter().map(|s| path(s)).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_files_and_folders_from_find() {
+        let output = b"f\tAlbum/01 Song.flac\t1234\nd\tAlbum\t0\nf\tname\twith tab.mp3\t5\n";
+        let manifest = parse_remote_file_manifest(output, "/sdcard/Music").unwrap();
+        assert_eq!(manifest.files["/sdcard/Music/Album/01 Song.flac"].size_bytes, 1234);
+        assert_eq!(manifest.files["/sdcard/Music/name\twith tab.mp3"].size_bytes, 5);
+        assert_eq!(manifest.directories, ["/sdcard/Music/Album"]);
+        assert!(parse_remote_file_manifest(b"garbage\n", "/sdcard/Music").is_none());
+    }
+
+    #[test]
+    fn plans_deleting_only_what_is_not_on_the_mac() {
+        let root = "/sdcard/Music";
+        let plan = local_plan(root, &["A/song.mp3", "Keep.mp3"], &["A"], &["Linked", ".DS_Store"]);
+        let mut manifest = RemoteManifest::default();
+        for file in [
+            "A/song.mp3",
+            "A/old.mp3",
+            "keep.MP3",
+            "Gone/x.mp3",
+            ".nomedia",
+            "A/.thumbs/t.jpg",
+            "Linked/inside.mp3",
+        ] {
+            manifest
+                .files
+                .insert(format!("{root}/{file}"), RemoteFileMetadata { size_bytes: 1 });
+        }
+        manifest.directories = vec![
+            format!("{root}/A"),
+            format!("{root}/Gone"),
+            format!("{root}/Gone/Deeper"),
+            format!("{root}/A/.thumbs"),
+            format!("{root}/Linked"),
+        ];
+
+        assert_eq!(
+            plan_deletions(&plan, root, &manifest),
+            DeletionPlan {
+                files: vec![format!("{root}/A/old.mp3"), format!("{root}/Gone/x.mp3")],
+                directories: vec![format!("{root}/Gone/Deeper"), format!("{root}/Gone")],
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_to_delete_in_storage_roots() {
+        for root in ["/", "/sdcard", "/storage/emulated/0", "/sdcard/android", "/data"] {
+            assert!(is_protected_remote_root(root), "{root}");
+        }
+        for root in ["/sdcard/Music", "/storage/emulated/0/Podcasts", "/sdcard/Android/media"] {
+            assert!(!is_protected_remote_root(root), "{root}");
+        }
+    }
+
+    #[test]
+    fn shell_batches_quote_and_split_long_lists() {
+        let paths: Vec<String> = (0..2000).map(|i| format!("/sdcard/it's {i}")).collect();
+        let batches = shell_batches(&paths);
+        assert!(batches.len() > 1);
+        assert!(batches.iter().all(|b| b.iter().map(|p| p.len() + 1).sum::<usize>() <= 6_000));
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 2000);
+        assert_eq!(batches[0][0], "'/sdcard/it'\\''s 0'");
+    }
+
     #[test]
     fn failure_serialises_with_a_kind() {
         let value = serde_json::to_value(SyncFailure::Cancelled {
             dry_run: false,
             files_synced: 3,
+            files_deleted: 0,
             processed_files: 5,
             total_files: 9,
         })

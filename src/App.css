@@ -268,7 +268,13 @@ input {
   opacity: 0;
 }
 
-/* Preview switch */
+/* Switches */
+
+.options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
 
 .option {
   display: flex;
