@@ -1,5 +1,8 @@
 use rand::RngExt;
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use crate::{
     Result, RustADBError,
@@ -59,7 +62,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         self.get_transport_mut().write_message(message)?;
 
-        let message = self.get_transport_mut().read_message()?;
+        let message = self.read_handshake_message()?;
 
         // Check if a client is requesting a secure connection and upgrade it if necessary
         match message.header().command() {
@@ -84,9 +87,26 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
                 self.auth_handshake(message, private_key)
             }
             _ => Err(crate::RustADBError::WrongResponseReceived(
-                "Expected CNXN, STLS or AUTH command".to_string(),
                 message.header().command().to_string(),
+                "CNXN, STLS or AUTH".to_string(),
             )),
+        }
+    }
+
+    fn read_handshake_message(&mut self) -> Result<ADBTransportMessage> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            // USB treats a timeout rounded down to zero milliseconds as unbounded.
+            if remaining.as_millis() == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+            let message = self.transport.read_message_with_timeout(remaining)?;
+            match message.header().command() {
+                // A new CNXN closes any streams left by the previous host connection.
+                MessageCommand::Clse | MessageCommand::Okay | MessageCommand::Write => continue,
+                _ => return Ok(message),
+            }
         }
     }
 
@@ -118,7 +138,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         self.transport.write_message(message)?;
 
-        let received_response = self.transport.read_message()?;
+        let received_response = self.read_handshake_message()?;
 
         if received_response.header().command() == MessageCommand::Cnxn {
             log::info!(
@@ -127,6 +147,7 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             );
             return Ok(());
         }
+        received_response.assert_command(MessageCommand::Auth)?;
 
         let mut pubkey = private_key.android_pubkey_encode()?.into_bytes();
         pubkey.push(b'\0');
@@ -136,13 +157,8 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
 
         self.transport.write_message(message)?;
 
-        let response = self
-            .transport
-            .read_message_with_timeout(Duration::from_secs(10))
-            .and_then(|message| {
-                message.assert_command(MessageCommand::Cnxn)?;
-                Ok(message)
-            })?;
+        let response = self.read_handshake_message()?;
+        response.assert_command(MessageCommand::Cnxn)?;
 
         log::info!(
             "Authentication OK, device info {}",
@@ -208,8 +224,9 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             &quit_buffer.encode(),
         )?)?;
 
-        let _discard_close = self.transport.read_message()?;
-        Ok(())
+        let response = self.transport.read_message()?;
+        response.assert_command(MessageCommand::Clse)?;
+        session.close()
     }
 }
 
@@ -217,5 +234,75 @@ impl<T: ADBMessageTransport> Drop for ADBMessageDevice<T> {
     fn drop(&mut self) {
         // Best effort here
         let _ = self.get_transport_mut().disconnect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ADBTransport;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct ScriptedTransport {
+        incoming: Arc<Mutex<VecDeque<ADBTransportMessage>>>,
+        sent: Arc<Mutex<Vec<MessageCommand>>>,
+    }
+
+    impl ADBTransport for ScriptedTransport {
+        fn connect(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn disconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ADBMessageTransport for ScriptedTransport {
+        fn read_message_with_timeout(&mut self, timeout: Duration) -> Result<ADBTransportMessage> {
+            assert!(!timeout.is_zero());
+            self.incoming
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut).into())
+        }
+
+        fn write_message_with_timeout(
+            &mut self,
+            message: ADBTransportMessage,
+            _: Duration,
+        ) -> Result<()> {
+            self.sent.lock().unwrap().push(message.header().command());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn handshake_skips_interrupted_stream_packets_and_authenticates() {
+        use MessageCommand::{Auth, Clse, Cnxn, Okay, Write};
+
+        let incoming = [
+            ADBTransportMessage::try_new(Clse, 1, 2, &[]).unwrap(),
+            ADBTransportMessage::try_new(Okay, 1, 2, &[]).unwrap(),
+            ADBTransportMessage::try_new(Auth, AUTH_TOKEN, 0, &[0; 20]).unwrap(),
+            ADBTransportMessage::try_new(Write, 1, 2, b"stale").unwrap(),
+            ADBTransportMessage::try_new(Cnxn, 0, 0, b"device::").unwrap(),
+        ];
+        let mut device = ADBMessageDevice {
+            transport: ScriptedTransport {
+                incoming: Arc::new(Mutex::new(incoming.into())),
+                sent: Arc::default(),
+            },
+        };
+
+        device.connect(&ADBRsaKey::new_random().unwrap()).unwrap();
+
+        assert!(device.transport.incoming.lock().unwrap().is_empty());
+        assert_eq!(*device.transport.sent.lock().unwrap(), [Cnxn, Auth]);
     }
 }

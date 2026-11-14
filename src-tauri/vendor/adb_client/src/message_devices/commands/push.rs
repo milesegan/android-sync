@@ -21,16 +21,21 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
         let mut send_buffer = send_buffer.encode();
         send_buffer.append(&mut path_header.as_bytes().to_vec());
 
-        session.send_and_expect_okay(ADBTransportMessage::try_new(
-            MessageCommand::Write,
-            session.local_id(),
-            session.remote_id(),
-            &send_buffer,
-        )?)?;
-
-        session.push_file(stream)?;
-        self.end_transaction(&mut session)?;
-
-        Ok(())
+        let result = (|| {
+            session.send_and_expect_okay(ADBTransportMessage::try_new(
+                MessageCommand::Write,
+                session.local_id(),
+                session.remote_id(),
+                &send_buffer,
+            )?)?;
+            session.push_file(stream)?;
+            self.end_transaction(&mut session)
+        })();
+        if result.is_err()
+            && let Err(error) = session.close()
+        {
+            log::debug!("Could not close failed ADB push: {error}");
+        }
+        result
     }
 }

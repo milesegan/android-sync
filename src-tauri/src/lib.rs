@@ -5,9 +5,13 @@ use adb_client::{ADBDeviceExt, AdbStatResponse, RustADBError};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use tauri::{Emitter, Manager, Window};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use tauri::{Emitter, Manager, RunEvent, State, Window, WindowEvent};
 
 #[derive(Debug, Serialize)]
 pub struct SyncSummary {
@@ -23,6 +27,8 @@ pub struct SyncSummary {
 }
 
 const PROGRESS_EVENT: &str = "sync-progress";
+#[cfg(target_os = "macos")]
+const QUIT_MENU_ID: &str = "quit-android-sync";
 const USB_AUTHORIZATION_HELP: &str =
     "Unlock your phone, start sync again, and tap Allow if “Allow USB debugging?” appears. If there is no prompt, reconnect the USB cable and try again.";
 
@@ -126,14 +132,109 @@ struct RemoteFileMetadata {
     size_bytes: u64,
 }
 
+#[derive(Default)]
+struct SyncState {
+    active: Option<Arc<AtomicBool>>,
+    exiting: bool,
+}
+
+impl SyncState {
+    fn request_exit(&mut self) -> bool {
+        self.exiting = true;
+        if let Some(cancelled) = &self.active {
+            cancelled.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "Sync stopped",
+        ));
+    }
+    Ok(())
+}
+
+struct SyncFileReader<'a> {
+    file: File,
+    cancelled: &'a AtomicBool,
+}
+
+impl Read for SyncFileReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        check_cancelled(self.cancelled)?;
+        self.file.read(buffer)
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
+        .manage(Mutex::new(SyncState::default()))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![sync_folders])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .invoke_handler(tauri::generate_handler![sync_folders]);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(|app| {
+            use tauri::menu::{Menu, MenuItem, MenuItemKind};
+
+            let menu = Menu::default(app)?;
+            if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.first() {
+                // Cocoa's default Quit action terminates without a Tauri ExitRequested event.
+                if let Some(last_index) = app_menu.items()?.len().checked_sub(1) {
+                    app_menu.remove_at(last_index)?;
+                    app_menu.append(&MenuItem::with_id(
+                        app,
+                        QUIT_MENU_ID,
+                        format!("Quit {}", app.package_info().name),
+                        true,
+                        Some("Cmd+Q"),
+                    )?)?;
+                }
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == QUIT_MENU_ID {
+                app.exit(0);
+            }
+        });
+
+    builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            RunEvent::WindowEvent {
+                event: WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                if app
+                    .state::<Mutex<SyncState>>()
+                    .lock()
+                    .unwrap()
+                    .request_exit()
+                {
+                    api.prevent_close();
+                }
+            }
+            RunEvent::ExitRequested { api, .. } => {
+                if app
+                    .state::<Mutex<SyncState>>()
+                    .lock()
+                    .unwrap()
+                    .request_exit()
+                {
+                    api.prevent_exit();
+                }
+            }
+            _ => {}
+        });
 }
 
 #[tauri::command]
@@ -142,13 +243,37 @@ async fn sync_folders(
     local_path: String,
     device_path: String,
     dry_run: bool,
+    state: State<'_, Mutex<SyncState>>,
 ) -> Result<SyncSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        perform_sync(window, local_path, device_path, dry_run)
+    let cancelled = Arc::new(AtomicBool::new(false));
+    {
+        let mut state = state.lock().unwrap();
+        if state.exiting {
+            return Err("Android Sync is closing.".into());
+        }
+        if state.active.is_some() {
+            return Err("A sync is already running.".into());
+        }
+        state.active = Some(Arc::clone(&cancelled));
+    }
+
+    let app = window.app_handle().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        perform_sync(window, local_path, device_path, dry_run, &cancelled)
     })
-    .await
-    .map_err(|e| format!("sync task failed: {e}"))?
-    .map_err(|e| e.to_string())
+    .await;
+
+    let exiting = {
+        let mut state = state.lock().unwrap();
+        state.active = None;
+        state.exiting
+    };
+    if exiting {
+        app.exit(0);
+    }
+    result
+        .map_err(|e| format!("sync task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 fn perform_sync(
@@ -156,12 +281,13 @@ fn perform_sync(
     local_path: String,
     device_path: String,
     dry_run: bool,
+    cancelled: &AtomicBool,
 ) -> Result<SyncSummary, SyncError> {
     let mut progress = ProgressReporter::new(window);
     progress.emit(SyncPhase::Scanning, None);
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
-    let sync_plan = build_sync_plan(&local_root, &remote_root)?;
+    let sync_plan = build_sync_plan(&local_root, &remote_root, cancelled)?;
     progress.total_files = sync_plan.files.len();
 
     progress.emit(SyncPhase::Connecting, None);
@@ -172,7 +298,9 @@ fn perform_sync(
         .app_local_data_dir()
         .map_err(SyncError::AppData)?;
     let key_path = adb_key::adb_key_path(&app_data_dir).map_err(SyncError::AdbKey)?;
+    check_cancelled(cancelled)?;
     let mut shell_device = connect_with_retry(&device_info, &key_path)?;
+    check_cancelled(cancelled)?;
 
     let mut stats = SyncStats {
         skipped_entries: sync_plan.skipped_entries,
@@ -189,9 +317,11 @@ fn perform_sync(
         dry_run,
         &mut created_dirs,
         &mut stats,
+        cancelled,
     )?;
 
     progress.emit(SyncPhase::ReadingDeviceFiles, None);
+    check_cancelled(cancelled)?;
     let remote_files = collect_remote_file_manifest(&mut shell_device, &remote_root)?;
 
     let mut adb_device = Some(shell_device);
@@ -205,6 +335,7 @@ fn perform_sync(
         &mut stats,
         &mut progress,
         dry_run,
+        cancelled,
     )?;
 
     progress.emit(SyncPhase::SyncingFiles, None);
@@ -274,7 +405,11 @@ fn normalize_remote_path(path: &str) -> Result<String, SyncError> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-fn build_sync_plan(local_root: &Path, remote_root: &str) -> Result<LocalSyncPlan, SyncError> {
+fn build_sync_plan(
+    local_root: &Path,
+    remote_root: &str,
+    cancelled: &AtomicBool,
+) -> Result<LocalSyncPlan, SyncError> {
     let mut directories = HashSet::new();
     let mut files = Vec::new();
     let mut skipped_entries = 0;
@@ -287,6 +422,7 @@ fn build_sync_plan(local_root: &Path, remote_root: &str) -> Result<LocalSyncPlan
         &mut directories,
         &mut files,
         &mut skipped_entries,
+        cancelled,
     )?;
 
     let mut directories: Vec<_> = directories.into_iter().collect();
@@ -310,8 +446,10 @@ fn collect_local_entries(
     directories: &mut HashSet<String>,
     files: &mut Vec<LocalFileEntry>,
     skipped_entries: &mut usize,
+    cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
     for entry in fs::read_dir(current)? {
+        check_cancelled(cancelled)?;
         let entry = entry?;
         let entry_path = entry.path();
 
@@ -335,6 +473,7 @@ fn collect_local_entries(
                 directories,
                 files,
                 skipped_entries,
+                cancelled,
             )?;
         } else if metadata.is_file() {
             let remote_file = build_remote_path(remote_root, relative_path);
@@ -360,8 +499,10 @@ fn sync_files(
     stats: &mut SyncStats,
     progress: &mut ProgressReporter,
     dry_run: bool,
+    cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
     for file in files {
+        check_cancelled(cancelled)?;
         progress.emit(SyncPhase::SyncingFiles, Some(&file.remote_path));
         push_file(
             device_info,
@@ -371,6 +512,7 @@ fn sync_files(
             remote_files,
             stats,
             dry_run,
+            cancelled,
         )
         .map_err(|source| SyncError::FileSync(file.remote_path.clone(), Box::new(source)))?;
         progress.processed_files += 1;
@@ -387,6 +529,7 @@ fn push_file(
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
     stats: &mut SyncStats,
     dry_run: bool,
+    cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
     let device = device_opt.as_mut().expect("device should be present");
     if file_is_unchanged(
@@ -399,8 +542,12 @@ fn push_file(
     }
 
     if !dry_run {
-        let mut local_file = File::open(file.local_path.as_path())?;
-        if let Err(error) = device.push(&mut local_file, &file.remote_path) {
+        let mut reader = SyncFileReader {
+            file: File::open(&file.local_path)?,
+            cancelled,
+        };
+        if let Err(error) = device.push(&mut reader, &file.remote_path) {
+            check_cancelled(cancelled)?;
             if !matches!(&error, RustADBError::WrongResponseReceived(actual, expected)
                 if actual == "WRTE" && expected == "OKAY")
             {
@@ -432,6 +579,7 @@ fn create_remote_directories(
     dry_run: bool,
     created_dirs: &mut HashSet<String>,
     stats: &mut SyncStats,
+    cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
     let mut pending_directories = Vec::new();
 
@@ -450,7 +598,7 @@ fn create_remote_directories(
     }
 
     if !dry_run {
-        batch_create_remote_directories(device, &pending_directories)
+        batch_create_remote_directories(device, &pending_directories, cancelled)
             .map_err(|error| SyncError::AdbOperation("creating device folders", error))?;
     }
 
@@ -460,6 +608,7 @@ fn create_remote_directories(
 fn batch_create_remote_directories(
     device: &mut ADBUSBDevice,
     directories: &[String],
+    cancelled: &AtomicBool,
 ) -> Result<(), RustADBError> {
     const MAX_COMMAND_LEN: usize = 6_000;
 
@@ -469,6 +618,7 @@ fn batch_create_remote_directories(
     for directory in directories {
         let escaped = shell_escape_single_quotes(directory.as_str());
         if has_pending && command.len() + escaped.len() + 1 > MAX_COMMAND_LEN {
+            check_cancelled(cancelled)?;
             let mut sink = io::sink();
             device.shell_command(&command, Some(&mut sink), None)?;
             command.clear();
@@ -481,6 +631,7 @@ fn batch_create_remote_directories(
     }
 
     if has_pending {
+        check_cancelled(cancelled)?;
         let mut sink = io::sink();
         device.shell_command(&command, Some(&mut sink), None)?;
     }
@@ -738,6 +889,11 @@ impl std::fmt::Display for SyncError {
                 f,
                 "Android did not respond while connecting over USB. {USB_AUTHORIZATION_HELP}"
             ),
+            SyncError::AdbConnection(RustADBError::IOError(err))
+                if err.kind() == io::ErrorKind::TimedOut =>
+            {
+                write!(f, "Android did not respond while connecting over USB. {USB_AUTHORIZATION_HELP}")
+            }
             SyncError::AdbConnection(RustADBError::DeviceBusy) => write!(
                 f,
                 "Another app is using the Android USB debugging connection. Close it and try again. If an ADB server is running, stop it with adb kill-server."

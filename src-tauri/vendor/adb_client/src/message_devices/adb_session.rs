@@ -47,9 +47,22 @@ impl<T: ADBMessageTransport> ADBSession<T> {
         self.remote_id
     }
 
+    pub(crate) fn close(&mut self) -> Result<()> {
+        self.transport.write_message(ADBTransportMessage::try_new(
+            MessageCommand::Clse,
+            self.local_id,
+            self.remote_id,
+            &[],
+        )?)
+    }
+
     /// Receive a message and acknowledge it by replying with an `OKAY` command
     pub(crate) fn recv_and_reply_okay(&mut self) -> Result<ADBTransportMessage> {
         let message = self.transport.read_message()?;
+        if message.header().command() == MessageCommand::Clse {
+            self.close()?;
+            return Ok(message);
+        }
         self.transport.write_message(ADBTransportMessage::try_new(
             MessageCommand::Okay,
             self.local_id,
@@ -202,11 +215,16 @@ impl<T: ADBMessageTransport> ADBSession<T> {
 
 impl<T: ADBMessageTransport> Drop for ADBSession<T> {
     fn drop(&mut self) {
-        // some devices will repeat the trailing CLSE command to ensure
-        // the client has acknowledged it. Read them quickly if present.
-        while let Ok(_discard_close_message) = self
-            .transport
-            .read_message_with_timeout(Duration::from_millis(20))
-        {}
+        // Some devices repeat the trailing CLSE. Bound cleanup so a faulty
+        // peer cannot keep the session alive by continuously sending packets.
+        let deadline = std::time::Instant::now() + Duration::from_millis(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.as_millis() == 0
+                || self.transport.read_message_with_timeout(remaining).is_err()
+            {
+                break;
+            }
+        }
     }
 }

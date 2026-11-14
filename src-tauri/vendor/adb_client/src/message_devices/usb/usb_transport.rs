@@ -11,7 +11,6 @@ use crate::{
     message_devices::{
         adb_message_transport::ADBMessageTransport,
         adb_transport_message::{ADBTransportMessage, ADBTransportMessageHeader},
-        message_commands::MessageCommand,
     },
 };
 
@@ -202,17 +201,7 @@ impl ADBTransport for USBTransport {
     }
 
     fn disconnect(&mut self) -> crate::Result<()> {
-        if self.handle.is_none() {
-            // device has not been initialized, nothing to do
-            return Ok(());
-        }
-
-        let message = ADBTransportMessage::try_new(MessageCommand::Clse, 0, 0, &[])?;
-        if let Err(e) = self.write_message(message) {
-            log::error!("error while sending CLSE message: {e}");
-        }
-
-        if let Some(handle) = &self.handle {
+        if let Some(handle) = self.handle.take() {
             let endpoint = self.read_endpoint.as_ref().or(self.write_endpoint.as_ref());
             if let Some(endpoint) = &endpoint {
                 match handle.release_interface(endpoint.iface) {
@@ -227,6 +216,10 @@ impl ADBTransport for USBTransport {
 }
 
 impl ADBMessageTransport for USBTransport {
+    fn read_message(&mut self) -> Result<ADBTransportMessage> {
+        self.read_message_with_timeout(Duration::from_secs(15))
+    }
+
     fn write_message_with_timeout(
         &mut self,
         message: ADBTransportMessage,
