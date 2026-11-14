@@ -944,13 +944,22 @@ fn open_device(
     loop {
         match ADBUSBDevice::new_with_custom_private_key(vendor_id, product_id, key_path) {
             Ok(device) => return Ok(device),
-            Err(RustADBError::DeviceBusy) if retries > 0 => {
+            Err(error) if is_usb_claimed_elsewhere(&error) && retries > 0 => {
                 thread::sleep(Duration::from_millis(100));
                 retries -= 1;
             }
             Err(error) => return Err(SyncError::AdbConnection(error)),
         }
     }
+}
+
+/// libusb reports a USB interface held by another process (usually an ADB
+/// server) as busy on Linux and as access denied on macOS.
+fn is_usb_claimed_elsewhere(error: &RustADBError) -> bool {
+    matches!(
+        error,
+        RustADBError::DeviceBusy | RustADBError::UsbError(rusb::Error::Access)
+    )
 }
 
 fn is_pending_usb_authorization(error: &RustADBError) -> bool {
@@ -1041,7 +1050,7 @@ impl std::fmt::Display for SyncError {
             {
                 write!(f, "Android did not respond while connecting over USB. {USB_AUTHORIZATION_HELP}")
             }
-            SyncError::AdbConnection(RustADBError::DeviceBusy) => write!(
+            SyncError::AdbConnection(err) if is_usb_claimed_elsewhere(err) => write!(
                 f,
                 "Another app is using the Android USB debugging connection. Close it and try again. If an ADB server is running, stop it with adb kill-server."
             ),
@@ -1134,6 +1143,14 @@ mod tests {
         assert!(state.cancel());
         assert!(flag.load(Ordering::Relaxed));
         assert!(!state.exiting);
+    }
+
+    #[test]
+    fn usb_access_denied_explains_the_other_app() {
+        for error in [RustADBError::DeviceBusy, RustADBError::UsbError(rusb::Error::Access)] {
+            let message = SyncError::AdbConnection(error).to_string();
+            assert!(message.starts_with("Another app is using"), "{message}");
+        }
     }
 
     #[test]
