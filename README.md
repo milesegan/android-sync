@@ -18,6 +18,10 @@ Get the latest `.dmg` from the
 open it, and drag **Android Sync** to Applications. It's signed and notarized,
 and runs on Apple silicon and Intel Macs.
 
+Android Sync needs **macOS 11 Big Sur or later**. On Big Sur and Monterey,
+install the latest Safari update too (Safari 16.4 or newer), because the app's
+window is drawn by the system's built-in WebKit.
+
 ## What a sync does
 
 - **Copies one way, Mac → phone.** A file is copied when it is missing on the
