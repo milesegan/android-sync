@@ -9,9 +9,11 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    mpsc, Arc, Mutex,
 };
-use tauri::{Emitter, Manager, RunEvent, State, Window, WindowEvent};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use tauri::{webview::PageLoadEvent, Emitter, Manager, RunEvent, State, Window, WindowEvent};
 
 #[derive(Debug, Serialize)]
 pub struct SyncSummary {
@@ -26,7 +28,32 @@ pub struct SyncSummary {
     dry_run: bool,
 }
 
+/// Why `sync_folders` did not return a summary. The frontend tells a user stop
+/// apart from a failure by `kind`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SyncFailure {
+    Cancelled {
+        dry_run: bool,
+        files_synced: usize,
+        processed_files: usize,
+        total_files: usize,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl SyncFailure {
+    fn failed(message: impl Into<String>) -> Self {
+        SyncFailure::Failed {
+            message: message.into(),
+        }
+    }
+}
+
 const PROGRESS_EVENT: &str = "sync-progress";
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(target_os = "macos")]
 const QUIT_MENU_ID: &str = "quit-android-sync";
 const USB_AUTHORIZATION_HELP: &str =
@@ -141,6 +168,10 @@ struct SyncState {
 impl SyncState {
     fn request_exit(&mut self) -> bool {
         self.exiting = true;
+        self.cancel()
+    }
+
+    fn cancel(&self) -> bool {
         if let Some(cancelled) = &self.active {
             cancelled.store(true, Ordering::Relaxed);
             return true;
@@ -149,15 +180,46 @@ impl SyncState {
     }
 }
 
-fn check_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
+/// Marks an `io::Error` raised because the user stopped the sync, so it can be
+/// recognised after passing through adb_client's error types.
+#[derive(Debug)]
+struct SyncCancelled;
+
+impl std::fmt::Display for SyncCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Sync stopped")
+    }
+}
+
+impl std::error::Error for SyncCancelled {}
+
+fn cancelled_io_error() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, SyncCancelled)
+}
+
+fn is_cancelled_io_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<SyncCancelled>())
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), SyncError> {
     if cancelled.load(Ordering::Relaxed) {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionAborted,
-            "Sync stopped",
-        ));
+        return Err(SyncError::Cancelled);
     }
     Ok(())
 }
+
+fn check_cancelled_io(cancelled: &AtomicBool) -> io::Result<()> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(cancelled_io_error());
+    }
+    Ok(())
+}
+
+/// A USB handshake abandoned by a cancelled sync. It may still hold the device
+/// until its read times out, so the next connection waits for it first.
+static ABANDONED_CONNECTION: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 struct SyncFileReader<'a> {
     file: File,
@@ -166,7 +228,7 @@ struct SyncFileReader<'a> {
 
 impl Read for SyncFileReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        check_cancelled(self.cancelled)?;
+        check_cancelled_io(self.cancelled)?;
         self.file.read(buffer)
     }
 }
@@ -177,7 +239,14 @@ pub fn run() {
         .manage(Mutex::new(SyncState::default()))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![sync_folders]);
+        // The window starts hidden so it does not flash a light background in
+        // dark mode before the page has painted.
+        .on_page_load(|webview, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                let _ = webview.window().show();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![sync_folders, cancel_sync]);
 
     #[cfg(target_os = "macos")]
     let builder = builder
@@ -244,22 +313,40 @@ async fn sync_folders(
     device_path: String,
     dry_run: bool,
     state: State<'_, Mutex<SyncState>>,
-) -> Result<SyncSummary, String> {
+) -> Result<SyncSummary, SyncFailure> {
     let cancelled = Arc::new(AtomicBool::new(false));
     {
         let mut state = state.lock().unwrap();
         if state.exiting {
-            return Err("Android Sync is closing.".into());
+            return Err(SyncFailure::failed("Android Sync is closing."));
         }
         if state.active.is_some() {
-            return Err("A sync is already running.".into());
+            return Err(SyncFailure::failed("A sync is already running."));
         }
         state.active = Some(Arc::clone(&cancelled));
     }
 
     let app = window.app_handle().clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        perform_sync(window, local_path, device_path, dry_run, &cancelled)
+        let mut progress = ProgressReporter::new(window);
+        let mut stats = SyncStats::default();
+        let result = perform_sync(
+            &mut progress,
+            &mut stats,
+            local_path,
+            device_path,
+            dry_run,
+            &cancelled,
+        );
+        result.map_err(|error| match error {
+            SyncError::Cancelled => SyncFailure::Cancelled {
+                dry_run,
+                files_synced: stats.files_synced,
+                processed_files: progress.processed_files,
+                total_files: progress.total_files,
+            },
+            error => SyncFailure::failed(error.to_string()),
+        })
     })
     .await;
 
@@ -271,25 +358,31 @@ async fn sync_folders(
     if exiting {
         app.exit(0);
     }
-    result
-        .map_err(|e| format!("sync task failed: {e}"))?
-        .map_err(|e| e.to_string())
+    result.map_err(|e| SyncFailure::failed(format!("sync task failed: {e}")))?
+}
+
+/// Asks the running sync to stop. Does nothing when no sync is running.
+#[tauri::command]
+fn cancel_sync(state: State<'_, Mutex<SyncState>>) {
+    state.lock().unwrap().cancel();
 }
 
 fn perform_sync(
-    window: Window,
+    progress: &mut ProgressReporter,
+    stats: &mut SyncStats,
     local_path: String,
     device_path: String,
     dry_run: bool,
     cancelled: &AtomicBool,
 ) -> Result<SyncSummary, SyncError> {
-    let mut progress = ProgressReporter::new(window);
     progress.emit(SyncPhase::Scanning, None);
     let local_root = canonicalize_local_root(&local_path)?;
     let remote_root = normalize_remote_path(&device_path)?;
     let sync_plan = build_sync_plan(&local_root, &remote_root, cancelled)?;
     progress.total_files = sync_plan.files.len();
+    stats.skipped_entries = sync_plan.skipped_entries;
 
+    check_cancelled(cancelled)?;
     progress.emit(SyncPhase::Connecting, None);
     let device_info = detect_android_device()?;
     let app_data_dir = progress
@@ -298,14 +391,9 @@ fn perform_sync(
         .app_local_data_dir()
         .map_err(SyncError::AppData)?;
     let key_path = adb_key::adb_key_path(&app_data_dir).map_err(SyncError::AdbKey)?;
-    check_cancelled(cancelled)?;
-    let mut shell_device = connect_with_retry(&device_info, &key_path)?;
+    let mut shell_device = connect_with_retry(&device_info, &key_path, cancelled)?;
     check_cancelled(cancelled)?;
 
-    let mut stats = SyncStats {
-        skipped_entries: sync_plan.skipped_entries,
-        ..SyncStats::default()
-    };
     let mut created_dirs = HashSet::new();
 
     if !dry_run {
@@ -316,7 +404,7 @@ fn perform_sync(
         &sync_plan.directories,
         dry_run,
         &mut created_dirs,
-        &mut stats,
+        stats,
         cancelled,
     )?;
 
@@ -332,8 +420,8 @@ fn perform_sync(
         &mut adb_device,
         &sync_plan.files,
         remote_files.as_ref(),
-        &mut stats,
-        &mut progress,
+        stats,
+        progress,
         dry_run,
         cancelled,
     )?;
@@ -514,7 +602,10 @@ fn sync_files(
             dry_run,
             cancelled,
         )
-        .map_err(|source| SyncError::FileSync(file.remote_path.clone(), Box::new(source)))?;
+        .map_err(|source| match source {
+            SyncError::Cancelled => SyncError::Cancelled,
+            source => SyncError::FileSync(file.remote_path.clone(), Box::new(source)),
+        })?;
         progress.processed_files += 1;
     }
 
@@ -555,7 +646,7 @@ fn push_file(
             }
 
             drop(device_opt.take());
-            let mut verification_device = connect_with_retry(device_info, key_path)?;
+            let mut verification_device = connect_with_retry(device_info, key_path, cancelled)?;
             if !file_is_unchanged(
                 &mut verification_device,
                 &file.remote_path,
@@ -599,7 +690,7 @@ fn create_remote_directories(
 
     if !dry_run {
         batch_create_remote_directories(device, &pending_directories, cancelled)
-            .map_err(|error| SyncError::AdbOperation("creating device folders", error))?;
+            .map_err(|error| SyncError::adb_operation("creating device folders", error))?;
     }
 
     Ok(())
@@ -618,7 +709,7 @@ fn batch_create_remote_directories(
     for directory in directories {
         let escaped = shell_escape_single_quotes(directory.as_str());
         if has_pending && command.len() + escaped.len() + 1 > MAX_COMMAND_LEN {
-            check_cancelled(cancelled)?;
+            check_cancelled_io(cancelled)?;
             let mut sink = io::sink();
             device.shell_command(&command, Some(&mut sink), None)?;
             command.clear();
@@ -631,7 +722,7 @@ fn batch_create_remote_directories(
     }
 
     if has_pending {
-        check_cancelled(cancelled)?;
+        check_cancelled_io(cancelled)?;
         let mut sink = io::sink();
         device.shell_command(&command, Some(&mut sink), None)?;
     }
@@ -652,7 +743,7 @@ fn collect_remote_file_manifest(
 
     device
         .shell_command(&command, Some(&mut output), None)
-        .map_err(|error| SyncError::AdbOperation("reading device files", error))?;
+        .map_err(|error| SyncError::adb_operation("reading device files", error))?;
 
     Ok(parse_remote_file_manifest(output.as_slice(), remote_root))
 }
@@ -788,20 +879,73 @@ fn detect_android_device() -> Result<AndroidDeviceInfo, SyncError> {
     }
 }
 
+/// Opens an ADB connection without blocking cancellation. The USB handshake can
+/// wait several seconds for the phone, so it runs on its own thread while this
+/// thread watches the cancel flag.
 fn connect_with_retry(
     device: &AndroidDeviceInfo,
+    key_path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<ADBUSBDevice, SyncError> {
+    wait_for_abandoned_connection(cancelled)?;
+
+    let (vendor_id, product_id) = (device.vendor_id, device.product_id);
+    let key_path = key_path.to_path_buf();
+    let (sender, receiver) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        // If the sync was cancelled the receiver is gone, and the device is
+        // dropped here, which releases USB.
+        let _ = sender.send(open_device(vendor_id, product_id, &key_path));
+    });
+
+    loop {
+        match receiver.recv_timeout(CANCEL_POLL_INTERVAL) {
+            Ok(result) => {
+                let _ = handle.join();
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    *ABANDONED_CONNECTION.lock().unwrap() = Some(handle);
+                    return Err(SyncError::Cancelled);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                return Err(SyncError::Io(io::Error::other(
+                    "the USB connection thread stopped unexpectedly",
+                )));
+            }
+        }
+    }
+}
+
+fn wait_for_abandoned_connection(cancelled: &AtomicBool) -> Result<(), SyncError> {
+    let Some(handle) = ABANDONED_CONNECTION.lock().unwrap().take() else {
+        return Ok(());
+    };
+    while !handle.is_finished() {
+        if cancelled.load(Ordering::Relaxed) {
+            *ABANDONED_CONNECTION.lock().unwrap() = Some(handle);
+            return Err(SyncError::Cancelled);
+        }
+        thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+    let _ = handle.join();
+    Ok(())
+}
+
+fn open_device(
+    vendor_id: u16,
+    product_id: u16,
     key_path: &Path,
 ) -> Result<ADBUSBDevice, SyncError> {
     let mut retries = 5;
     loop {
-        match ADBUSBDevice::new_with_custom_private_key(
-            device.vendor_id,
-            device.product_id,
-            key_path,
-        ) {
+        match ADBUSBDevice::new_with_custom_private_key(vendor_id, product_id, key_path) {
             Ok(device) => return Ok(device),
             Err(RustADBError::DeviceBusy) if retries > 0 => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(100));
                 retries -= 1;
             }
             Err(error) => return Err(SyncError::AdbConnection(error)),
@@ -852,6 +996,8 @@ struct SyncStats {
 
 #[derive(Debug)]
 enum SyncError {
+    /// The user stopped the sync, or the app is quitting.
+    Cancelled,
     InvalidLocalPath(String),
     InvalidRemotePath(String),
     DeviceNotFound,
@@ -869,6 +1015,7 @@ enum SyncError {
 impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SyncError::Cancelled => write!(f, "Sync stopped"),
             SyncError::InvalidLocalPath(msg) => write!(f, "{msg}"),
             SyncError::InvalidRemotePath(msg) => write!(f, "{msg}"),
             SyncError::DeviceNotFound => write!(
@@ -914,6 +1061,15 @@ impl std::fmt::Display for SyncError {
 
 impl std::error::Error for SyncError {}
 
+impl SyncError {
+    fn adb_operation(operation: &'static str, error: RustADBError) -> Self {
+        match SyncError::from(error) {
+            SyncError::Adb(error) => SyncError::AdbOperation(operation, error),
+            other => other,
+        }
+    }
+}
+
 impl From<rusb::Error> for SyncError {
     fn from(value: rusb::Error) -> Self {
         SyncError::Usb(value)
@@ -922,12 +1078,76 @@ impl From<rusb::Error> for SyncError {
 
 impl From<RustADBError> for SyncError {
     fn from(value: RustADBError) -> Self {
-        SyncError::Adb(value)
+        match value {
+            RustADBError::IOError(error) if is_cancelled_io_error(&error) => SyncError::Cancelled,
+            other => SyncError::Adb(other),
+        }
     }
 }
 
 impl From<io::Error> for SyncError {
     fn from(value: io::Error) -> Self {
-        SyncError::Io(value)
+        if is_cancelled_io_error(&value) {
+            SyncError::Cancelled
+        } else {
+            SyncError::Io(value)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_reader_error_is_a_cancellation_through_adb_errors() {
+        let error = SyncError::from(RustADBError::IOError(cancelled_io_error()));
+        assert!(matches!(error, SyncError::Cancelled));
+
+        let error = SyncError::adb_operation(
+            "creating device folders",
+            RustADBError::IOError(cancelled_io_error()),
+        );
+        assert!(matches!(error, SyncError::Cancelled));
+    }
+
+    #[test]
+    fn other_aborted_connections_stay_failures() {
+        let aborted = io::Error::new(io::ErrorKind::ConnectionAborted, "Sync stopped");
+        assert!(matches!(SyncError::from(aborted), SyncError::Io(_)));
+    }
+
+    #[test]
+    fn cancel_without_a_running_sync_is_a_no_op() {
+        let state = SyncState::default();
+        assert!(!state.cancel());
+        assert!(!state.exiting);
+    }
+
+    #[test]
+    fn cancel_sets_the_flag_without_exiting() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let state = SyncState {
+            active: Some(Arc::clone(&flag)),
+            exiting: false,
+        };
+        assert!(state.cancel());
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(!state.exiting);
+    }
+
+    #[test]
+    fn failure_serialises_with_a_kind() {
+        let value = serde_json::to_value(SyncFailure::Cancelled {
+            dry_run: false,
+            files_synced: 3,
+            processed_files: 5,
+            total_files: 9,
+        })
+        .unwrap();
+        assert_eq!(value["kind"], "cancelled");
+        let value = serde_json::to_value(SyncFailure::failed("boom")).unwrap();
+        assert_eq!(value["kind"], "failed");
+        assert_eq!(value["message"], "boom");
     }
 }

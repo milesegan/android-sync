@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { homeDir } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import "./App.css";
@@ -21,6 +22,19 @@ type SyncSummary = {
   dry_run: boolean;
 };
 
+/** Error value of `sync_folders`, see `SyncFailure` in lib.rs. */
+type SyncFailure =
+  | {
+      kind: "cancelled";
+      dry_run: boolean;
+      files_synced: number;
+      processed_files: number;
+      total_files: number;
+    }
+  | { kind: "failed"; message: string };
+
+type StoppedInfo = Extract<SyncFailure, { kind: "cancelled" }>;
+
 type SyncPhase =
   | "scanning"
   | "connecting"
@@ -35,15 +49,26 @@ type SyncProgress = {
   current_file: string | null;
 };
 
+type Outcome =
+  | { kind: "complete"; summary: SyncSummary }
+  | { kind: "stopped"; info: StoppedInfo }
+  | { kind: "error"; message: string };
+
 const LOCAL_PATH_STORAGE_KEY = "android-sync:lastLocalPath";
 const DEVICE_PATH_STORAGE_KEY = "android-sync:lastDevicePath";
+const DEFAULT_DEVICE_PATH = "/sdcard/AndroidSync";
 const PROGRESS_EVENT = "sync-progress";
-const PROGRESS_DETAILS: Record<SyncPhase, string> = {
-  scanning: "Scanning local files…",
-  connecting: "Connecting over USB. Unlock your phone and tap Allow if “Allow USB debugging?” appears.",
-  creating_directories: "Creating folders on your phone…",
-  reading_device_files: "Reading files on your phone…",
-  syncing_files: "Checking files…",
+
+const PHASE_HEADINGS: Record<SyncPhase, string> = {
+  scanning: "Scanning files",
+  connecting: "Connecting to your phone",
+  creating_directories: "Creating folders",
+  reading_device_files: "Reading files on your phone",
+  syncing_files: "Copying files",
+};
+
+const PHASE_DETAILS: Partial<Record<SyncPhase, string>> = {
+  connecting: "Unlock your phone and tap Allow if “Allow USB debugging?” appears.",
 };
 
 const formatBytes = (bytes: number) => {
@@ -58,99 +83,91 @@ const formatBytes = (bytes: number) => {
   return `${value.toFixed(1)} ${units[unitIndex]}`;
 };
 
-const formatUsbId = (value: number) => value.toString(16).padStart(4, "0");
+const plural = (count: number, word: string) =>
+  `${count.toLocaleString()} ${word}${count === 1 ? "" : "s"}`;
+
+const readStored = (key: string, fallback: string) => {
+  try {
+    return window.localStorage.getItem(key) || fallback;
+  } catch (storageError) {
+    console.warn(`Failed to restore ${key}:`, storageError);
+    return fallback;
+  }
+};
+
+const writeStored = (key: string, value: string) => {
+  try {
+    if (value) {
+      window.localStorage.setItem(key, value);
+    } else {
+      window.localStorage.removeItem(key);
+    }
+  } catch (storageError) {
+    console.warn(`Failed to persist ${key}:`, storageError);
+  }
+};
+
+const toFailure = (err: unknown): SyncFailure => {
+  if (err && typeof err === "object" && "kind" in err) {
+    return err as SyncFailure;
+  }
+  return {
+    kind: "failed",
+    message: err instanceof Error ? err.message : String(err),
+  };
+};
+
+/** Splits a path into a part that may be truncated and a last segment that stays visible. */
+const splitPath = (path: string, home: string | null) => {
+  let display = path;
+  if (home) {
+    const trimmedHome = home.replace(/\/+$/, "");
+    if (display === trimmedHome || display.startsWith(`${trimmedHome}/`)) {
+      display = `~${display.slice(trimmedHome.length)}`;
+    }
+  }
+  const index = display.lastIndexOf("/");
+  if (index <= 0) return { head: "", tail: display };
+  return { head: display.slice(0, index), tail: display.slice(index) };
+};
+
+/** Strips the phone folder from a remote file path so the part that differs stays visible. */
+const relativeToRoot = (file: string, root: string) => {
+  const trimmedRoot = `/${root.trim().split("/").filter(Boolean).join("/")}`;
+  return file.startsWith(`${trimmedRoot}/`) ? file.slice(trimmedRoot.length + 1) : file;
+};
 
 function App() {
-  const [localPath, setLocalPath] = useState("");
-  const [devicePath, setDevicePath] = useState("/sdcard/AndroidSync");
+  const [localPath, setLocalPath] = useState(() => readStored(LOCAL_PATH_STORAGE_KEY, ""));
+  const [devicePath, setDevicePath] = useState(() =>
+    readStored(DEVICE_PATH_STORAGE_KEY, DEFAULT_DEVICE_PATH)
+  );
   const [dryRun, setDryRun] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [status, setStatus] = useState("");
-  const [error, setError] = useState("");
-  const [summary, setSummary] = useState<SyncSummary | null>(null);
+  const [stopping, setStopping] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
-  const [localPathHydrated, setLocalPathHydrated] = useState(false);
-  const [devicePathHydrated, setDevicePathHydrated] = useState(false);
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [home, setHome] = useState<string | null>(null);
+  const devicePathInput = useRef<HTMLInputElement>(null);
 
-  const canSync = useMemo(() => {
-    return (
-      localPath.trim().length > 0 &&
-      devicePath.trim().length > 0 &&
-      !syncing
-    );
-  }, [devicePath, localPath, syncing]);
-
-  const progressPercent = useMemo(() => {
-    if (progress?.phase !== "syncing_files" || progress.total_files === 0) {
-      return null;
-    }
-    const ratio = progress.processed_files / progress.total_files;
-    return Math.round(ratio * 100);
-  }, [progress]);
+  useEffect(() => writeStored(LOCAL_PATH_STORAGE_KEY, localPath), [localPath]);
+  useEffect(() => writeStored(DEVICE_PATH_STORAGE_KEY, devicePath), [devicePath]);
 
   useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const stored = window.localStorage.getItem(LOCAL_PATH_STORAGE_KEY);
-      if (stored) {
-        setLocalPath(stored);
-      }
-    } catch (storageError) {
-      console.warn("Failed to restore last local path:", storageError);
-    } finally {
-      setLocalPathHydrated(true);
-    }
+    homeDir()
+      .then(setHome)
+      .catch(() => setHome(null));
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !localPathHydrated) return;
-    try {
-      if (localPath) {
-        window.localStorage.setItem(LOCAL_PATH_STORAGE_KEY, localPath);
-      } else {
-        window.localStorage.removeItem(LOCAL_PATH_STORAGE_KEY);
-      }
-    } catch (storageError) {
-      console.warn("Failed to persist local path:", storageError);
-    }
-  }, [localPath, localPathHydrated]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const stored = window.localStorage.getItem(DEVICE_PATH_STORAGE_KEY);
-      if (stored) {
-        setDevicePath(stored);
-      }
-    } catch (storageError) {
-      console.warn("Failed to restore last device path:", storageError);
-    } finally {
-      setDevicePathHydrated(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !devicePathHydrated) return;
-    try {
-      if (devicePath) {
-        window.localStorage.setItem(DEVICE_PATH_STORAGE_KEY, devicePath);
-      } else {
-        window.localStorage.removeItem(DEVICE_PATH_STORAGE_KEY);
-      }
-    } catch (storageError) {
-      console.warn("Failed to persist device path:", storageError);
-    }
-  }, [devicePath, devicePathHydrated]);
-
-  useEffect(() => {
-    let cancelled = false;
+    let disposed = false;
     let unlisten: UnlistenFn | null = null;
 
     listen<SyncProgress>(PROGRESS_EVENT, (event) => {
       setProgress(event.payload);
     })
       .then((fn) => {
-        if (cancelled) {
+        if (disposed) {
           fn();
         } else {
           unlisten = fn;
@@ -161,18 +178,13 @@ function App() {
       });
 
     return () => {
-      cancelled = true;
-      if (unlisten) {
-        unlisten();
-      }
+      disposed = true;
+      unlisten?.();
     };
   }, []);
 
-  useEffect(() => {
-    if (!syncing) {
-      setProgress(null);
-    }
-  }, [syncing]);
+  const hasLocalPath = localPath.trim().length > 0;
+  const hasDevicePath = devicePath.trim().length > 0;
 
   const pickLocalFolder = useCallback(async () => {
     try {
@@ -184,185 +196,392 @@ function App() {
       });
       if (typeof selection === "string") {
         setLocalPath(selection);
+        setOutcome(null);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setOutcome({ kind: "error", message: err instanceof Error ? err.message : String(err) });
     }
   }, [localPath]);
 
   const startSync = useCallback(async () => {
-    if (!canSync) return;
+    if (syncing || !hasLocalPath || !hasDevicePath) return;
     setSyncing(true);
-    setError("");
+    setStopping(false);
+    setOutcome(null);
     setProgress(null);
-    setStatus("");
     try {
-      const result = await invoke<SyncSummary>("sync_folders", {
+      const summary = await invoke<SyncSummary>("sync_folders", {
         localPath,
         devicePath,
         dryRun,
       });
-      setSummary(result);
-      setStatus(
-        result.dry_run ? "Dry run finished successfully." : "Sync finished successfully."
-      );
+      setOutcome({ kind: "complete", summary });
     } catch (err) {
-      setSummary(null);
-      setStatus("");
-      if (err instanceof Error) {
-        setError(err.message);
-      } else {
-        setError(String(err));
-      }
+      const failure = toFailure(err);
+      setOutcome(
+        failure.kind === "cancelled"
+          ? { kind: "stopped", info: failure }
+          : { kind: "error", message: failure.message }
+      );
     } finally {
       setSyncing(false);
+      setStopping(false);
+      setProgress(null);
     }
-  }, [canSync, devicePath, dryRun, localPath]);
+  }, [devicePath, dryRun, hasDevicePath, hasLocalPath, localPath, syncing]);
+
+  const cancelSync = useCallback(async () => {
+    setStopping(true);
+    try {
+      await invoke("cancel_sync");
+    } catch (err) {
+      console.warn("Could not stop the sync:", err);
+      setStopping(false);
+    }
+  }, []);
+
+  const localParts = splitPath(localPath, home);
 
   return (
-    <main className="container">
-      <h1>Android USB Sync</h1>
-      <p className="subtitle">
-        Mirror a local folder onto an Android device through ADB over USB.
-      </p>
+    <main className="app">
+      <fieldset className="settings" disabled={syncing}>
+        <legend className="visually-hidden">Sync settings</legend>
 
-      <form
-        className="sync-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          startSync();
-        }}
-      >
-        <label id="local-path-label">Local folder</label>
-        <div
-          className="folder-picker"
-          role="group"
-          aria-labelledby="local-path-label"
-          aria-live="polite"
-        >
-          <button
-            type="button"
-            className="folder-picker__button"
-            onClick={pickLocalFolder}
-          >
-            Choose folder
-          </button>
-          <span
-            className={
-              localPath
-                ? "folder-picker__path"
-                : "folder-picker__path folder-picker__path--placeholder"
-            }
-          >
-            {localPath || "No folder selected"}
-          </span>
-        </div>
-        <p className="form-hint">
-          Dotfiles such as <code>.DS_Store</code> are ignored automatically.
-        </p>
-
-        <label htmlFor="device-path">Device folder</label>
-        <input
-          id="device-path"
-          value={devicePath}
-          placeholder="/sdcard/AndroidSync"
-          onChange={(event) => setDevicePath(event.currentTarget.value)}
-        />
-
-        <div className="dry-run-toggle">
-          <p>
-            <strong>Dry run:</strong> {dryRun ? "Enabled" : "Disabled"}
-          </p>
-          <button
-            type="button"
-            className={`dry-run-toggle__button${dryRun ? " dry-run-toggle__button--active" : ""}`}
-            disabled={syncing}
-            onClick={() => setDryRun((previous) => !previous)}
-          >
-            {dryRun ? "Disable dry run" : "Enable dry run"}
-          </button>
-        </div>
-
-        <button type="submit" disabled={!canSync}>
-          {syncing ? "Syncing…" : "Start sync"}
-        </button>
-
-        {syncing && (
-          <div className="sync-progress" role="status" aria-live="polite">
-            <div className="sync-progress__header">
-              <strong>{dryRun ? "Simulating changes" : "Sync in progress"}</strong>
-              {progressPercent !== null && (
-                <span>{progressPercent}%</span>
+        <div className="route">
+          <div className="route__row">
+            <FolderIcon />
+            <div className="route__body">
+              <span className="route__label" id="local-path-label">
+                From this Mac
+              </span>
+              {hasLocalPath ? (
+                <span
+                  className="route__path"
+                  title={localPath}
+                  aria-labelledby="local-path-label"
+                >
+                  {localParts.head && <span className="path-head">{localParts.head}</span>}
+                  <span className="path-tail">{localParts.tail}</span>
+                </span>
+              ) : (
+                <span className="route__empty">No folder selected</span>
               )}
             </div>
-            <div
-              className={`sync-progress__bar${progressPercent === null ? " sync-progress__bar--indeterminate" : ""}`}
-              aria-hidden={progressPercent === null ? undefined : true}
+            <button
+              type="button"
+              className="link-button"
+              onClick={pickLocalFolder}
+              aria-label={hasLocalPath ? "Change folder on this Mac" : "Choose folder on this Mac"}
             >
-              <div
-                className="sync-progress__bar-fill"
-                style={
-                  progressPercent === null
-                    ? undefined
-                    : { width: `${progressPercent}%` }
-                }
-              />
-            </div>
-            <p className="sync-progress__details">
-              {progress?.phase === "syncing_files" && progress.total_files > 0
-                ? `Processed ${progress.processed_files} of ${progress.total_files} files`
-                : PROGRESS_DETAILS[progress?.phase ?? "scanning"]}
-            </p>
-            {progress?.current_file && (
-              <code className="sync-progress__path">{progress.current_file}</code>
-            )}
+              {hasLocalPath ? "Change" : "Choose"}
+            </button>
           </div>
+
+          <div className="route__row">
+            <PhoneIcon />
+            <div className="route__body">
+              <label className="route__label" htmlFor="device-path">
+                To your phone
+              </label>
+              <div className="route__edit">
+                <input
+                  id="device-path"
+                  ref={devicePathInput}
+                  className="route__input"
+                  value={devicePath}
+                  placeholder={DEFAULT_DEVICE_PATH}
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  title={devicePath}
+                  onChange={(event) => {
+                    setDevicePath(event.currentTarget.value);
+                    setOutcome(null);
+                  }}
+                />
+                <PencilIcon />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="option">
+          <div className="option__text">
+            <span className="option__title" id="preview-label">
+              Preview only
+            </span>
+            <span className="option__hint" id="preview-hint">
+              List changes without copying
+            </span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            className="switch"
+            aria-checked={dryRun}
+            aria-labelledby="preview-label"
+            aria-describedby="preview-hint"
+            onClick={() => {
+              setDryRun((previous) => !previous);
+              setOutcome(null);
+            }}
+          >
+            <span className="switch__thumb" />
+          </button>
+        </div>
+      </fieldset>
+
+      <section className="bottom">
+        {syncing ? (
+          <SyncingPanel
+            progress={progress}
+            devicePath={devicePath}
+            dryRun={dryRun}
+            stopping={stopping}
+            onCancel={cancelSync}
+          />
+        ) : (
+          <>
+            <div className="bottom__body">
+              {outcome?.kind === "complete" && <CompletePanel summary={outcome.summary} />}
+              {outcome?.kind === "stopped" && <StoppedNotice info={outcome.info} />}
+              {outcome?.kind === "error" && (
+                <div className="notice notice--danger" role="alert">
+                  <AlertIcon />
+                  <div>
+                    <p className="notice__title">Sync failed</p>
+                    <p className="notice__text">{outcome.message}</p>
+                  </div>
+                </div>
+              )}
+              {!outcome && (!hasLocalPath || !hasDevicePath) && (
+                <p className="hint">
+                  {!hasLocalPath
+                    ? "Choose a folder on this Mac to sync."
+                    : "Enter a folder on your phone to sync to."}
+                </p>
+              )}
+            </div>
+            {!hasLocalPath ? (
+              <button type="button" className="button button--primary" onClick={pickLocalFolder}>
+                Choose folder
+              </button>
+            ) : !hasDevicePath ? (
+              <button
+                type="button"
+                className="button button--primary"
+                onClick={() => devicePathInput.current?.focus()}
+              >
+                Enter phone folder
+              </button>
+            ) : (
+              <button type="button" className="button button--primary" onClick={startSync}>
+                {outcome?.kind === "complete"
+                  ? dryRun
+                    ? "Preview again"
+                    : "Sync again"
+                  : dryRun
+                    ? "Preview changes"
+                    : "Start sync"}
+              </button>
+            )}
+          </>
         )}
-      </form>
-
-      {status && <p className="status">{status}</p>}
-      {error && <p className="error">{error}</p>}
-
-      {summary && (
-        <section className="summary">
-          <h2>Last sync</h2>
-          <ul>
-            <li>
-              <strong>Mode:</strong> {summary.dry_run ? "Dry run" : "Full sync"}
-            </li>
-            <li>
-              <strong>Local:</strong> {summary.local_root}
-            </li>
-            <li>
-              <strong>Device:</strong> {summary.remote_path}
-            </li>
-            <li>
-              <strong>Files synced:</strong> {summary.files_synced}
-            </li>
-            <li>
-              <strong>Files deleted:</strong> {summary.files_deleted}
-            </li>
-            <li>
-              <strong>Directories touched:</strong>{" "}
-              {summary.directories_created}
-            </li>
-            <li>
-              <strong>Skipped entries:</strong> {summary.skipped_entries}
-            </li>
-            <li>
-              <strong>Transferred:</strong> {formatBytes(summary.bytes_uploaded)}
-            </li>
-            <li>
-              <strong>Device info:</strong>{" "}
-              {summary.device.manufacturer ?? "Unknown vendor"} (
-              {summary.device.product ?? "Unknown model"} @{" "}
-              {formatUsbId(summary.device.vendor_id)}:
-              {formatUsbId(summary.device.product_id)})
-            </li>
-          </ul>
-        </section>
-      )}
+      </section>
     </main>
+  );
+}
+
+function SyncingPanel({
+  progress,
+  devicePath,
+  dryRun,
+  stopping,
+  onCancel,
+}: {
+  progress: SyncProgress | null;
+  devicePath: string;
+  dryRun: boolean;
+  stopping: boolean;
+  onCancel: () => void;
+}) {
+  const phase = progress?.phase ?? "scanning";
+  const counting = phase === "syncing_files" && (progress?.total_files ?? 0) > 0;
+  const percent = counting
+    ? Math.round((progress!.processed_files / progress!.total_files) * 100)
+    : null;
+  const heading =
+    phase === "syncing_files" && dryRun ? "Checking files" : PHASE_HEADINGS[phase];
+  const detail = counting
+    ? `${progress!.processed_files.toLocaleString()} of ${plural(progress!.total_files, "file")}`
+    : PHASE_DETAILS[phase];
+  const currentFile =
+    phase === "syncing_files" && progress?.current_file
+      ? splitPath(relativeToRoot(progress.current_file, devicePath), null)
+      : null;
+
+  return (
+    <>
+      <div className="bottom__body">
+        <div className="progress" role="status" aria-live="polite">
+          <div className="progress__header">
+            <span className="progress__heading">{stopping ? "Stopping…" : heading}</span>
+            {percent !== null && <span className="progress__percent">{percent}%</span>}
+          </div>
+          <div
+            className={`progress__track${percent === null ? " progress__track--indeterminate" : ""}`}
+            role="progressbar"
+            aria-label={heading}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percent ?? undefined}
+          >
+            <div
+              className="progress__fill"
+              style={percent === null ? undefined : { width: `${percent}%` }}
+            />
+          </div>
+          {detail && <p className="progress__detail">{detail}</p>}
+          {currentFile && (
+            <p className="progress__file" title={progress!.current_file!}>
+              {currentFile.head && <span className="path-head">{currentFile.head}</span>}
+              <span className="path-tail">{currentFile.tail}</span>
+            </p>
+          )}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="button button--secondary"
+        onClick={onCancel}
+        disabled={stopping}
+      >
+        {stopping ? "Stopping…" : "Cancel"}
+      </button>
+    </>
+  );
+}
+
+function CompletePanel({ summary }: { summary: SyncSummary }) {
+  const device = [summary.device.manufacturer, summary.device.product]
+    .filter(Boolean)
+    .join(" ");
+  const preview = summary.dry_run;
+  const tiles = [
+    { value: summary.files_synced.toLocaleString(), label: preview ? "Files to copy" : "Files copied" },
+    { value: formatBytes(summary.bytes_uploaded), label: preview ? "To transfer" : "Transferred" },
+    { value: summary.files_deleted.toLocaleString(), label: preview ? "To delete" : "Deleted" },
+    { value: summary.skipped_entries.toLocaleString(), label: "Skipped" },
+  ];
+
+  return (
+    <div className="complete" role="status">
+      <p className="complete__title">
+        <CheckIcon />
+        {preview ? "Preview complete" : "Sync complete"}
+      </p>
+      <dl className="stats">
+        {tiles.map((tile) => (
+          <div className="stats__tile" key={tile.label}>
+            <dt className="stats__label">{tile.label}</dt>
+            <dd className="stats__value">{tile.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {device && <p className="complete__device">{device}</p>}
+    </div>
+  );
+}
+
+function StoppedNotice({ info }: { info: StoppedInfo }) {
+  const checkedAny = info.total_files > 0 && info.processed_files > 0;
+  let text: string;
+  if (info.dry_run) {
+    text = checkedAny
+      ? `Checked ${info.processed_files.toLocaleString()} of ${plural(info.total_files, "file")}.`
+      : "Stopped before any files were checked.";
+  } else if (checkedAny) {
+    text = `Checked ${info.processed_files.toLocaleString()} of ${plural(
+      info.total_files,
+      "file"
+    )} and copied ${info.files_synced.toLocaleString()}. Start again to pick up where it left off.`;
+  } else {
+    text = "Stopped before any files were copied.";
+  }
+
+  return (
+    <div className="notice notice--warning" role="status">
+      <StopIcon />
+      <div>
+        <p className="notice__title">{info.dry_run ? "Preview stopped" : "Sync stopped"}</p>
+        <p className="notice__text">{text}</p>
+      </div>
+    </div>
+  );
+}
+
+const iconProps = {
+  width: 16,
+  height: 16,
+  viewBox: "0 0 16 16",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.4,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+  "aria-hidden": true,
+  focusable: false,
+};
+
+function FolderIcon() {
+  return (
+    <svg {...iconProps} className="icon route__icon">
+      <path d="M1.75 4.25c0-.69.56-1.25 1.25-1.25h3l1.5 1.5H13c.69 0 1.25.56 1.25 1.25v6.25c0 .69-.56 1.25-1.25 1.25H3c-.69 0-1.25-.56-1.25-1.25z" />
+    </svg>
+  );
+}
+
+function PhoneIcon() {
+  return (
+    <svg {...iconProps} className="icon route__icon">
+      <rect x="4.25" y="1.75" width="7.5" height="12.5" rx="1.5" />
+      <path d="M7 12h2" />
+    </svg>
+  );
+}
+
+function PencilIcon() {
+  return (
+    <svg {...iconProps} width={12} height={12} className="icon route__pencil">
+      <path d="M10.5 2.5l3 3-8 8H2.5v-3z" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg {...iconProps} className="icon">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M5.25 8.25l1.75 1.75 3.75-4" />
+    </svg>
+  );
+}
+
+function StopIcon() {
+  return (
+    <svg {...iconProps} className="icon notice__icon">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M6.25 5.75v4.5M9.75 5.75v4.5" />
+    </svg>
+  );
+}
+
+function AlertIcon() {
+  return (
+    <svg {...iconProps} className="icon notice__icon">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M8 4.75v3.75M8 11h.01" />
+    </svg>
   );
 }
 
