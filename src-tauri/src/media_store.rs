@@ -1,9 +1,10 @@
-use adb_client::{usb::ADBUSBDevice, ADBDeviceExt, RustADBError};
+use adb_client::RustADBError;
 use std::sync::atomic::AtomicBool;
 
 use crate::{check_cancelled_io, shell_escape_single_quotes, LocalFileEntry};
 
 const FILES_URI: &str = "content://media/external/file";
+const NO_QUERY_RESULTS: &str = "No result found.";
 const PENDING_MEDIA: &str = "is_pending=1 AND date_expires IS NULL AND \
                              owner_package_name='com.android.shell' AND media_type IN (1,2,3,4)";
 // Leave room for shell quoting and the command itself.
@@ -12,16 +13,14 @@ const MAX_PATH_LIST_LEN: usize = 16_000;
 const MAX_FILES_PER_UPDATE: usize = 64;
 
 pub(crate) fn publish_pending_files(
-    device: &mut ADBUSBDevice,
     remote_root: &str,
     files: &[LocalFileEntry],
+    copied_files: bool,
     cancelled: &AtomicBool,
+    mut run_shell: impl FnMut(&str, &mut Vec<u8>) -> Result<Option<u8>, RustADBError>,
 ) -> Result<(), RustADBError> {
-    let mut shell_output = |command: &str| {
-        checked_shell_output(cancelled, |output| {
-            device.shell_command(&command, Some(output), None)
-        })
-    };
+    let mut shell_output =
+        |command: &str| checked_shell_output(cancelled, |output| run_shell(command, output));
     // Android 11 introduced FUSE entries for media created through filesystem paths.
     let root = shell_escape_single_quotes(remote_root);
     let resolved_root = shell_output(&format!(
@@ -30,6 +29,20 @@ pub(crate) fn publish_pending_files(
     let Some(canonical_root) = canonical_storage_root(&resolved_root)? else {
         return Ok(());
     };
+
+    if !copied_files {
+        let selection = shell_escape_single_quotes(&pending_directory_selection(canonical_root));
+        let result = shell_output(&format!(
+            "content query --uri {FILES_URI} --projection _id \
+             --extra 'android\\:query-arg-match-pending:i:1' \
+             --extra 'android\\:query-arg-limit:i:1' --where {selection}"
+        ))?;
+        // Proceed with exact path batches if there is pending media or if the
+        // device doesn't support the directory probe.
+        if result.trim() == NO_QUERY_RESULTS {
+            return Ok(());
+        }
+    }
 
     // Include files that already matched, so the next sync can finish publication
     // if a previous sync ended after writing the file.
@@ -82,6 +95,18 @@ fn canonical_storage_root(output: &str) -> Result<Option<&str>, RustADBError> {
     )))
 }
 
+fn pending_directory_selection(root: &str) -> String {
+    // '/' is immediately before '0' in SQLite's NOCASE ordering. This range
+    // matches descendants without interpreting any wildcard in the folder name.
+    let start = sql_string_literal(&format!("{root}/"));
+    let end = sql_string_literal(&format!("{root}0"));
+    format!("_data COLLATE NOCASE >= {start} AND _data COLLATE NOCASE < {end} AND {PENDING_MEDIA}")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn pending_file_selections(
     files: &[LocalFileEntry],
     remote_root: &str,
@@ -99,7 +124,7 @@ fn pending_file_selections(
     for file in files {
         let relative_path = &file.remote_path[remote_root.len()..];
         let path = format!("{canonical_root}{relative_path}");
-        let literal = format!("'{}'", path.replace('\'', "''"));
+        let literal = sql_string_literal(&path);
         let quoted_len = shell_escape_single_quotes(&literal).len() + 1;
         if paths.len() == MAX_FILES_PER_UPDATE
             || (!paths.is_empty() && length + quoted_len > MAX_PATH_LIST_LEN)
@@ -119,7 +144,7 @@ fn pending_file_selections(
 
 fn pending_file_ids(output: &str) -> Result<Vec<u64>, RustADBError> {
     let output = output.trim();
-    if output == "No result found." {
+    if output == NO_QUERY_RESULTS {
         return Ok(Vec::new());
     }
     if output.is_empty() {
@@ -153,6 +178,90 @@ fn checked_shell_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synced_library_without_pending_media_skips_publication_updates() {
+        let root = "/sdcard/Music";
+        let files = (0..130)
+            .map(|i| LocalFileEntry {
+                local_path: format!("track {i}.m4a").into(),
+                remote_path: format!("{root}/track {i}.m4a"),
+                size_bytes: 100,
+                mtime: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut updates = 0;
+        publish_pending_files(
+            root,
+            &files,
+            false,
+            &AtomicBool::new(false),
+            |command, output| {
+                if command.starts_with("if ") {
+                    output.extend_from_slice(b"/storage/emulated/0/Music\n");
+                } else if command.starts_with("content query ") {
+                    output.extend_from_slice(b"No result found.\n");
+                } else {
+                    updates += 1;
+                    output.extend_from_slice(b"published\n");
+                }
+                Ok(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(updates, 0);
+    }
+
+    #[test]
+    fn resyncs_still_publish_pending_files_with_the_exact_path_filter() {
+        let root = "/sdcard/Music/it's 100%_live";
+        let canonical_root = "/storage/emulated/0/Music/it's 100%_live";
+        let files = [LocalFileEntry {
+            local_path: "track.m4a".into(),
+            remote_path: format!("{root}/track.m4a"),
+            size_bytes: 100,
+            mtime: 0,
+        }];
+        for (copied_files, probe_response) in [
+            (false, "Row: 0 _id=23\n"),
+            (false, "Unsupported argument: --extra\n"),
+            (true, ""),
+        ] {
+            let mut commands = Vec::new();
+            publish_pending_files(
+                root,
+                &files,
+                copied_files,
+                &AtomicBool::new(false),
+                |command, output| {
+                    commands.push(command.to_owned());
+                    if command.starts_with("if ") {
+                        output.extend_from_slice(canonical_root.as_bytes());
+                    } else if command.starts_with("content query ") {
+                        output.extend_from_slice(probe_response.as_bytes());
+                    } else {
+                        output.extend_from_slice(b"published\n");
+                    }
+                    Ok(None)
+                },
+            )
+            .unwrap();
+            assert_eq!(commands.len(), if copied_files { 2 } else { 3 });
+            if !copied_files {
+                assert!(commands[1].contains(&shell_escape_single_quotes(&format!(
+                    "_data COLLATE NOCASE >= '/storage/emulated/0/Music/it''s 100%_live/' \
+                     AND _data COLLATE NOCASE < '/storage/emulated/0/Music/it''s 100%_live0' AND {PENDING_MEDIA}"
+                ))));
+            }
+            assert!(commands
+                .last()
+                .unwrap()
+                .contains(&shell_escape_single_quotes(&format!(
+                "_data COLLATE NOCASE IN ('/storage/emulated/0/Music/it''s 100%_live/track.m4a') \
+                 AND {PENDING_MEDIA}"
+            ))));
+        }
+    }
 
     #[test]
     fn cancellation_during_the_last_shell_command_takes_precedence() {

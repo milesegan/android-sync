@@ -482,10 +482,11 @@ fn perform_sync(
     if !dry_run && !sync_plan.files.is_empty() {
         progress.emit(SyncPhase::PublishingMedia, None);
         media_store::publish_pending_files(
-            &mut shell_device,
             &remote_root,
             &sync_plan.files,
+            stats.files_synced > 0,
             cancelled,
+            |command, output| shell_device.shell_command(&command, Some(output), None),
         )
         .map_err(|error| SyncError::adb_operation("publishing completed media", error))?;
     }
