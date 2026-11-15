@@ -13,6 +13,9 @@ ADB stream on failure so the app can stop a transfer before releasing USB.
 `ADBUSBDevice::push_with_mtime` sends the file's modification time in the
 push's final DONE message, which adbd applies to the file. The stock USB push
 sends 0 there, which leaves every pushed file dated 1970. `push` still sends 0.
+The file upload acknowledges and checks adbd's sync status before sending
+QUIT. It accepts either order of the sync status and the transport OKAY for
+DONE.
 
 Switch the app back to the crates.io dependency when a published version
 includes these changes.

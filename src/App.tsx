@@ -43,6 +43,7 @@ type SyncPhase =
   | "creating_directories"
   | "reading_device_files"
   | "syncing_files"
+  | "publishing_media"
   | "deleting_files";
 
 type SyncProgress = {
@@ -69,6 +70,7 @@ const PHASE_HEADINGS: Record<SyncPhase, string> = {
   creating_directories: "Creating folders",
   reading_device_files: "Reading files on your phone",
   syncing_files: "Copying files",
+  publishing_media: "Making media available",
   deleting_files: "Deleting extra files",
 };
 

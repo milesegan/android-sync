@@ -63,13 +63,17 @@ impl<T: ADBMessageTransport> ADBSession<T> {
             self.close()?;
             return Ok(message);
         }
+        self.reply_okay()?;
+        Ok(message)
+    }
+
+    fn reply_okay(&mut self) -> Result<()> {
         self.transport.write_message(ADBTransportMessage::try_new(
             MessageCommand::Okay,
             self.local_id,
             self.remote_id,
             &[],
-        )?)?;
-        Ok(message)
+        )?)
     }
 
     /// Expect a message with an `OKAY` command after sending a message.
@@ -154,18 +158,7 @@ impl<T: ADBMessageTransport> ADBSession<T> {
                         &subcommand_data.encode(),
                     )?;
 
-                    self.send_and_expect_okay(message)?;
-
-                    // Command should end with a Write => Okay
-                    let received = self.transport.read_message()?;
-                    match received.header().command() {
-                        MessageCommand::Write => return Ok(()),
-                        c => {
-                            return Err(RustADBError::ADBRequestFailed(format!(
-                                "Wrong command received {c}"
-                            )));
-                        }
-                    }
+                    return self.finish_push(message);
                 }
                 Ok(size) => {
                     let subcommand_data = MessageSubcommand::Data.with_arg(u32::try_from(size)?);
@@ -187,6 +180,69 @@ impl<T: ADBMessageTransport> ADBSession<T> {
                 }
             }
         }
+    }
+
+    fn finish_push(&mut self, done: ADBTransportMessage) -> Result<()> {
+        self.transport.write_message(done)?;
+        let mut acknowledged = false;
+        let mut status = Vec::with_capacity(8);
+        let mut complete = false;
+
+        // A sync status can span several WRTE packets, with the transport
+        // acknowledgement for DONE arriving at any point.
+        while !acknowledged || !complete {
+            let response = self.read_push_response()?;
+            match response.header().command() {
+                MessageCommand::Okay if !acknowledged => acknowledged = true,
+                MessageCommand::Write if !complete && !response.payload().is_empty() => {
+                    self.reply_okay()?;
+                    status.extend_from_slice(response.payload());
+                    complete = Self::check_push_status(&status)?;
+                }
+                command => {
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "Unexpected {command} after ADB upload"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_push_status(status: &[u8]) -> Result<bool> {
+        match status {
+            b"OKAY\0\0\0\0" => Ok(true),
+            [b'F', b'A', b'I', b'L', a, b, c, d, message @ ..] => {
+                let length = u32::from_le_bytes([*a, *b, *c, *d]) as usize;
+                if length <= BUFFER_SIZE && message.len() == length {
+                    let message = String::from_utf8_lossy(message);
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "Device rejected file upload: {message}"
+                    )));
+                }
+                if length <= BUFFER_SIZE && message.len() < length {
+                    return Ok(false);
+                }
+                Err(RustADBError::ADBRequestFailed(
+                    "Invalid ADB sync failure length".into(),
+                ))
+            }
+            partial if partial.len() < 8 => Ok(false),
+            _ => Err(RustADBError::ADBRequestFailed(
+                "Invalid ADB sync status after upload".into(),
+            )),
+        }
+    }
+
+    fn read_push_response(&mut self) -> Result<ADBTransportMessage> {
+        let response = self.transport.read_message()?;
+        let header = response.header();
+        if header.arg0() != self.remote_id || header.arg1() != self.local_id {
+            return Err(RustADBError::ADBRequestFailed(
+                "Upload response belongs to a different ADB stream".into(),
+            ));
+        }
+        Ok(response)
     }
 
     pub(crate) fn stat_with_explicit_ids(&mut self, remote_path: &str) -> Result<AdbStatResponse> {

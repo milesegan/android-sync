@@ -1,4 +1,5 @@
 mod adb_key;
+mod media_store;
 
 use adb_client::usb::{find_all_connected_adb_devices, ADBUSBDevice};
 use adb_client::{ADBDeviceExt, AdbStatResponse, RustADBError};
@@ -77,6 +78,7 @@ enum SyncPhase {
     CreatingDirectories,
     ReadingDeviceFiles,
     SyncingFiles,
+    PublishingMedia,
     DeletingFiles,
 }
 
@@ -467,12 +469,8 @@ fn perform_sync(
     check_cancelled(cancelled)?;
     let remote_manifest = collect_remote_file_manifest(&mut shell_device, &remote_root)?;
 
-    let mut adb_device = Some(shell_device);
-
     sync_files(
-        &device_info,
-        &key_path,
-        &mut adb_device,
+        &mut shell_device,
         &sync_plan.files,
         remote_manifest.as_ref().map(|manifest| &manifest.files),
         stats,
@@ -481,14 +479,24 @@ fn perform_sync(
         cancelled,
     )?;
 
+    if !dry_run && !sync_plan.files.is_empty() {
+        progress.emit(SyncPhase::PublishingMedia, None);
+        media_store::publish_pending_files(
+            &mut shell_device,
+            &remote_root,
+            &sync_plan.files,
+            cancelled,
+        )
+        .map_err(|error| SyncError::adb_operation("publishing completed media", error))?;
+    }
+
     if delete_extra {
         check_cancelled(cancelled)?;
         let remote_manifest = remote_manifest.ok_or(SyncError::UnreadableDeviceListing)?;
         let deletions = plan_deletions(&sync_plan, &remote_root, &remote_manifest);
         if !dry_run && !(deletions.files.is_empty() && deletions.directories.is_empty()) {
             progress.emit(SyncPhase::DeletingFiles, None);
-            let device = adb_device.as_mut().expect("device should be present");
-            delete_remote_entries(device, &deletions, stats, cancelled)
+            delete_remote_entries(&mut shell_device, &deletions, stats, cancelled)
                 .map_err(|error| SyncError::adb_operation("deleting extra files", error))?;
         } else {
             stats.files_deleted = deletions.files.len();
@@ -651,9 +659,7 @@ fn collect_local_entries(
 }
 
 fn sync_files(
-    device_info: &AndroidDeviceInfo,
-    key_path: &Path,
-    device_opt: &mut Option<ADBUSBDevice>,
+    device: &mut ADBUSBDevice,
     files: &[LocalFileEntry],
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
     stats: &mut SyncStats,
@@ -664,19 +670,11 @@ fn sync_files(
     for file in files {
         check_cancelled(cancelled)?;
         progress.emit(SyncPhase::SyncingFiles, Some(&file.remote_path));
-        push_file(
-            device_info,
-            key_path,
-            device_opt,
-            file,
-            remote_files,
-            stats,
-            dry_run,
-            cancelled,
-        )
-        .map_err(|source| match source {
-            SyncError::Cancelled => SyncError::Cancelled,
-            source => SyncError::FileSync(file.remote_path.clone(), Box::new(source)),
+        push_file(device, file, remote_files, stats, dry_run, cancelled).map_err(|source| {
+            match source {
+                SyncError::Cancelled => SyncError::Cancelled,
+                source => SyncError::FileSync(file.remote_path.clone(), Box::new(source)),
+            }
         })?;
         progress.processed_files += 1;
     }
@@ -685,16 +683,13 @@ fn sync_files(
 }
 
 fn push_file(
-    device_info: &AndroidDeviceInfo,
-    key_path: &Path,
-    device_opt: &mut Option<ADBUSBDevice>,
+    device: &mut ADBUSBDevice,
     file: &LocalFileEntry,
     remote_files: Option<&HashMap<String, RemoteFileMetadata>>,
     stats: &mut SyncStats,
     dry_run: bool,
     cancelled: &AtomicBool,
 ) -> Result<(), SyncError> {
-    let device = device_opt.as_mut().expect("device should be present");
     let remote = match remote_files {
         Some(remote_files) => remote_files.get(&file.remote_path).copied(),
         None => remote_metadata(device, &file.remote_path)?.map(|stat| RemoteFileMetadata {
@@ -711,21 +706,7 @@ fn push_file(
             file: File::open(&file.local_path)?,
             cancelled,
         };
-        if let Err(error) = device.push_with_mtime(&mut reader, &file.remote_path, file.mtime) {
-            check_cancelled(cancelled)?;
-            if !matches!(&error, RustADBError::WrongResponseReceived(actual, expected)
-                if actual == "WRTE" && expected == "OKAY")
-            {
-                return Err(error.into());
-            }
-
-            drop(device_opt.take());
-            let mut verification_device = connect_with_retry(device_info, key_path, cancelled)?;
-            if !remote_size_matches(&mut verification_device, &file.remote_path, file.size_bytes)? {
-                return Err(error.into());
-            }
-            *device_opt = Some(verification_device);
-        }
+        device.push_with_mtime(&mut reader, &file.remote_path, file.mtime)?;
     }
 
     stats.files_synced += 1;
@@ -968,16 +949,6 @@ fn shell_batches(paths: &[String]) -> Vec<Vec<String>> {
         batches.push(current);
     }
     batches
-}
-
-/// Checks whether a push that reported an error still wrote the whole file.
-fn remote_size_matches(
-    device: &mut ADBUSBDevice,
-    remote_path: &str,
-    size_bytes: u64,
-) -> Result<bool, SyncError> {
-    Ok(remote_metadata(device, remote_path)?
-        .is_some_and(|remote| u64::from(remote.file_size) == size_bytes))
 }
 
 fn remote_metadata(

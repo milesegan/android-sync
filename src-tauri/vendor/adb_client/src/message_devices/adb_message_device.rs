@@ -305,4 +305,67 @@ mod tests {
         assert!(device.transport.incoming.lock().unwrap().is_empty());
         assert_eq!(*device.transport.sent.lock().unwrap(), [Cnxn, Auth]);
     }
+
+    #[test]
+    fn acknowledges_upload_status_before_quitting_sync() {
+        use MessageCommand::{Clse, Okay, Write};
+
+        for status_first in [false, true] {
+            let packet =
+                |command, payload| ADBTransportMessage::try_new(command, 2, 1, payload).unwrap();
+            let mut incoming = [
+                packet(Okay, b""),
+                packet(Okay, b""),
+                packet(Write, b"OKAY\0\0\0\0"),
+                packet(Okay, b""),
+                packet(Clse, b""),
+            ];
+            if status_first {
+                incoming.swap(1, 2);
+            }
+            let mut device = ADBMessageDevice {
+                transport: ScriptedTransport {
+                    incoming: Arc::new(Mutex::new(incoming.into())),
+                    sent: Arc::default(),
+                },
+            };
+            let mut session = ADBSession::new(device.transport.clone(), 1, 2);
+
+            session
+                .push_file(b"audio".as_slice(), 1_700_000_000)
+                .unwrap();
+            device.end_transaction(&mut session).unwrap();
+
+            assert!(device.transport.incoming.lock().unwrap().is_empty());
+            assert_eq!(
+                *device.transport.sent.lock().unwrap(),
+                [Write, Write, Okay, Write, Clse]
+            );
+        }
+    }
+
+    #[test]
+    fn reports_upload_failure_across_packets() {
+        use MessageCommand::{Okay, Write};
+
+        let incoming = [
+            ADBTransportMessage::try_new(Okay, 2, 1, b"").unwrap(),
+            ADBTransportMessage::try_new(Write, 2, 1, b"FAIL\x06\0\0\0").unwrap(),
+            ADBTransportMessage::try_new(Okay, 2, 1, b"").unwrap(),
+            ADBTransportMessage::try_new(Write, 2, 1, b"EACCES").unwrap(),
+        ];
+        let transport = ScriptedTransport {
+            incoming: Arc::new(Mutex::new(incoming.into())),
+            sent: Arc::default(),
+        };
+        let mut session = ADBSession::new(transport.clone(), 1, 2);
+
+        let error = session
+            .push_file(b"audio".as_slice(), 1_700_000_000)
+            .unwrap_err();
+        assert!(
+            matches!(error, RustADBError::ADBRequestFailed(message) if message.contains("EACCES"))
+        );
+        assert_eq!(*transport.sent.lock().unwrap(), [Write, Write, Okay, Okay]);
+    }
 }
